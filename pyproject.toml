@@ -12,6 +12,8 @@ requires-python = ">=3.11"
 dependencies = [
     "fast-flights>=3.0",
     "rich>=13.0",
+    # fast-flights 3.x imports this but doesn't declare it
+    "typing-extensions>=4.0",
 ]
 
 [project.optional-dependencies]
