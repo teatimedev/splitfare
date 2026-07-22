@@ -1414,11 +1414,14 @@ def valid_date(s: str) -> str:
 
 
 def print_welcome() -> None:
-    cfg = json.loads(CONFIG_PATH.read_text())
+    if CONFIG_PATH.exists():
+        cfg = json.loads(CONFIG_PATH.read_text())
+        setup = (f"[dim]({'+'.join(cfg['origins'])} ⇄ {'+'.join(cfg['destination'])}, "
+                 f"{cfg['adults']} adults)[/dim]")
+    else:
+        setup = "[dim](not set up yet — run [/dim][bold]splitfare init[/bold][dim] first)[/dim]"
     console.print(Panel(
-        "[bold]splitfare[/bold] — cheap flight-combo hunter "
-        f"[dim]({'+'.join(cfg['origins'])} ⇄ {'+'.join(cfg['destination'])}, "
-        f"{cfg['adults']} adults)[/dim]\n\n"
+        f"[bold]splitfare[/bold] — cheap flight-combo hunter {setup}\n\n"
         "[bold cyan]Ask in plain English (easiest):[/bold cyan]\n"
         '  splitfare ask [green]"cheapest 24hrs in september for 2, landing before 2pm"[/green]\n\n'
         "[bold cyan]Or run it directly:[/bold cyan]\n"
