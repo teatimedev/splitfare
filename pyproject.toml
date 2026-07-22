@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splitfare"
+version = "0.1.0"
+description = "Flight-hacker's scanner for short trips: split tickets, trip-shape search across a month, and it knows what's on when you land."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fast-flights>=3.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+splitfare = "splitfare:main"
+splitfare-mcp = "mcp_server:main"
+
+[project.urls]
+Repository = "https://github.com/teatimedev/splitfare"
+
+[tool.setuptools]
+py-modules = ["splitfare", "providers", "mcp_server"]

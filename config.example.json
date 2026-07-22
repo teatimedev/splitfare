@@ -1,0 +1,12 @@
+{
+  "origins": ["BFS"],
+  "destination": ["IBZ"],
+  "hubs": ["LPL", "MAN", "LTN", "STN", "LGW", "BHX", "BRS", "LBA", "NCL", "EDI", "GLA", "DUB"],
+  "adults": 2,
+  "currency": "GBP",
+  "min_connect_minutes": 120,
+  "cache_ttl_hours": 6,
+  "events": {
+    "provider": "ibiza-spotlight"
+  }
+}
