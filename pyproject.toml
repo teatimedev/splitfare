@@ -14,6 +14,10 @@ dependencies = [
     "rich>=13.0",
     # fast-flights 3.x imports this but doesn't declare it
     "typing-extensions>=4.0",
+    # used directly (also transitive via fast-flights — pinned so an upstream
+    # stack swap can't break us)
+    "primp>=0.6",
+    "selectolax>=0.3",
 ]
 
 [project.optional-dependencies]

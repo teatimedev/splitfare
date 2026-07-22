@@ -73,7 +73,7 @@ def test_render_dashboard_smoke():
                 "outs": [out], "backs": [back]}]
     events = {"2026-08-16": [
         {"title": "Solomun +1", "venue": "Pacha Ibiza", "time": "23:00–06:00",
-         "from_eur": "50", "djs": ["Solomun"]}]}
+         "price_str": "from €50", "djs": ["Solomun"]}]}
     html = render_dashboard(results, events, {"origins": ["BFS"],
                             "destination": ["IBZ"], "adults": 2},
                             "Mon 20 Jul, 15:00", dead=[])
@@ -81,3 +81,64 @@ def test_render_dashboard_smoke():
     assert "day-2026-08-16" in html          # detail screen exists
     assert "BFS" in html and "MAN" in html
     assert nice_date("2026-08-16") in html
+
+
+def test_currency_symbol_threading():
+    import splitfare
+    splitfare.set_currency("EUR")
+    try:
+        assert splitfare.SYM == "€"
+        out = Option([leg()], "direct")
+        results = [{"total": 214, "od": "2026-08-16", "bd": "2026-08-17",
+                    "outs": [out], "backs": [out]}]
+        html = render_dashboard(results, {}, {"origins": ["BER"],
+                                "destination": ["LIS"], "adults": 2},
+                                "Mon 20 Jul, 15:00", dead=[])
+        assert "€214" in html and "£" not in html
+    finally:
+        splitfare.set_currency("GBP")
+
+
+def test_gf_link_respects_currency():
+    assert "curr=EUR" in gf_link("BER", "LIS", "2026-09-04", 2, "EUR")
+
+
+def test_hhmm_rejects_garbage():
+    import pytest
+    with pytest.raises(ValueError):
+        hhmm_to_min("2pm")
+    with pytest.raises(ValueError):
+        hhmm_to_min("25:99")
+
+
+def test_ticketmaster_parser():
+    import json
+    from providers import parse_ticketmaster
+    fixture = json.dumps({"_embedded": {"events": [{
+        "name": "Techno Night",
+        "dates": {"start": {"localTime": "23:00:00"}},
+        "priceRanges": [{"min": 15.5, "currency": "EUR"}],
+        "_embedded": {"venues": [{"name": "Warehouse X"}],
+                       "attractions": [{"name": "DJ A"}, {"name": "DJ B"}]},
+    }]}})
+    evs = parse_ticketmaster(fixture)
+    assert evs == [{"title": "Techno Night", "venue": "Warehouse X",
+                    "time": "23:00", "price_str": "from EUR 15.5",
+                    "djs": ["DJ A", "DJ B"]}]
+    assert parse_ticketmaster("not json") == []
+
+
+def test_skiddle_parser():
+    import json
+    from providers import parse_skiddle
+    fixture = json.dumps({"results": [{
+        "eventname": "Warehouse Project",
+        "venue": {"name": "Depot Mayfield"},
+        "openingtimes": {"doorsopen": "21:00"},
+        "entryprice": "£25",
+        "artists": [{"name": "Four Tet"}],
+    }]})
+    evs = parse_skiddle(fixture)
+    assert evs[0]["venue"] == "Depot Mayfield"
+    assert evs[0]["price_str"] == "£25"
+    assert parse_skiddle("{}") == []

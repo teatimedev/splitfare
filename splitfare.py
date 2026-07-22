@@ -57,6 +57,16 @@ SOCS = "CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg"
 
 POLITE_DELAY_S = 1.5
 
+CURRENCY_SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$", "SEK": "kr",
+                    "DKK": "kr", "NOK": "kr", "PLN": "zł", "CHF": "CHF",
+                    "CZK": "Kč", "HUF": "Ft"}
+SYM = "£"  # display symbol for the configured currency; set by load_config
+
+
+def set_currency(code: str) -> None:
+    global SYM
+    SYM = CURRENCY_SYMBOLS.get(code.upper(), code.upper() + " ")
+
 console = Console(highlight=False)
 
 # fetch health accounting — if Google starts stonewalling, most live fetches
@@ -91,7 +101,7 @@ class Leg:
     def describe(self) -> str:
         return (
             f"{self.airline} {self.origin}→{self.dest} "
-            f"{self.dep_hm}–{self.arr_hm} £{self.price}"
+            f"{self.dep_hm}–{self.arr_hm} {SYM}{self.price}"
         )
 
 
@@ -129,8 +139,14 @@ def fmt_dur(minutes: int) -> str:
 
 
 def hhmm_to_min(s: str) -> int:
-    h, m = s.split(":")
-    return int(h) * 60 + int(m)
+    try:
+        h, m = s.split(":")
+        v = int(h) * 60 + int(m)
+        if not 0 <= v < 1440:
+            raise ValueError
+        return v
+    except ValueError:
+        raise ValueError(f"'{s}' is not a time like 14:00") from None
 
 
 def dow(day: str) -> str:
@@ -141,9 +157,11 @@ def nice_date(day: str) -> str:
     return datetime.strptime(day, "%Y-%m-%d").strftime("%a %-d %b")
 
 
-def gf_link(origin: str, dest: str, day: str, adults: int) -> str:
+def gf_link(origin: str, dest: str, day: str, adults: int,
+            currency: str = "GBP") -> str:
     q = f"one way flights for {adults} adults from {origin} to {dest} on {day}"
-    return "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q) + "&curr=GBP"
+    return ("https://www.google.com/travel/flights?q=" + urllib.parse.quote(q)
+            + "&curr=" + currency)
 
 
 # ------------------------------------------------------------------- fetcher
@@ -164,6 +182,43 @@ def client() -> Client:
     return _client
 
 
+def fetch_ryanair(origin: str, dest: str, day: str, adults: int,
+                  currency: str) -> list[Leg]:
+    """Ryanair's public fare-finder (no key). Returns the cheapest fare per
+    flight; price is per-person so we multiply by party size — treat as an
+    estimate (fare tiers may bump the real total)."""
+    try:
+        r = client().get(
+            "https://services-api.ryanair.com/farfnd/v4/oneWayFares",
+            params={"departureAirportIataCode": origin,
+                    "arrivalAirportIataCode": dest,
+                    "outboundDepartureDateFrom": day,
+                    "outboundDepartureDateTo": day,
+                    "currency": currency})
+        fares = json.loads(r.text).get("fares", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+    legs = []
+    for f in fares:
+        o = f.get("outbound") or {}
+        price = (o.get("price") or {})
+        if price.get("currencyCode") != currency or price.get("value") is None:
+            continue
+        dep, arr = o.get("departureDate", ""), o.get("arrivalDate", "")
+        if not dep.startswith(day):
+            continue
+        legs.append(Leg(
+            origin=o["departureAirport"]["iataCode"],
+            dest=o["arrivalAirport"]["iataCode"],
+            date=day, airline="Ryanair",
+            dep_min=int(dep[11:13]) * 60 + int(dep[14:16]),
+            arr_min=int(arr[11:13]) * 60 + int(arr[14:16]),
+            arr_day_offset=0 if arr.startswith(day) else 1,
+            price=round(price["value"] * adults),
+        ))
+    return legs
+
+
 def fetch_legs(
     origin: str,
     dest: str,
@@ -173,8 +228,11 @@ def fetch_legs(
     ttl_hours: float,
     fresh: bool,
     status=None,
+    sources: tuple = ("google",),
 ) -> list[Leg]:
-    """All nonstop flights origin→dest on a date, cached."""
+    """All nonstop flights origin→dest on a date, cached. Google Flights is
+    the primary source; 'ryanair' in sources adds the public fare-finder as a
+    fallback when Google returns nothing for the route-date."""
     CACHE_DIR.mkdir(exist_ok=True)
     key = f"{origin}-{dest}-{day}-{adults}pax-{currency}.json"
     cache_file = CACHE_DIR / key
@@ -182,7 +240,10 @@ def fetch_legs(
     if not fresh and cache_file.exists():
         blob = json.loads(cache_file.read_text())
         age_h = (time.time() - blob["fetched_at"]) / 3600
-        if age_h <= ttl_hours:
+        # empty results get a short TTL so one consent hiccup doesn't poison
+        # a route-date for the full cache window
+        limit = ttl_hours if blob["legs"] else min(ttl_hours, 0.5)
+        if age_h <= limit:
             FETCH_STATS["cached"] += 1
             return [Leg(**l) for l in blob["legs"]]
 
@@ -235,6 +296,8 @@ def fetch_legs(
     FETCH_STATS["live"] += 1
     if not legs:
         FETCH_STATS["live_empty"] += 1
+        if "ryanair" in sources:
+            legs = fetch_ryanair(origin, dest, day, adults, currency)
 
     cache_file.write_text(
         json.dumps({"fetched_at": time.time(), "legs": [l.__dict__ for l in legs]})
@@ -271,6 +334,7 @@ def best_direction(
     currency = cfg.get("currency", "GBP")
     ttl = cfg.get("cache_ttl_hours", 6)
     min_connect = cfg.get("min_connect_minutes", 120)
+    src_list = tuple(cfg.get("flight_sources", ["google"]))
 
     froms, tos = (dest_airports, origins) if reverse else (origins, dest_airports)
 
@@ -282,7 +346,7 @@ def best_direction(
     # direct
     for o in froms:
         for d in tos:
-            for leg in fetch_legs(o, d, day, adults, currency, ttl, fresh, status):
+            for leg in fetch_legs(o, d, day, adults, currency, ttl, fresh, status, src_list):
                 if usable(leg):
                     options.append(Option([leg], "direct"))
 
@@ -291,13 +355,13 @@ def best_direction(
         first_legs = [
             l
             for o in froms
-            for l in fetch_legs(o, hub, day, adults, currency, ttl, fresh, status)
+            for l in fetch_legs(o, hub, day, adults, currency, ttl, fresh, status, src_list)
             if l.arr_day_offset == 0
         ]
         second_legs = [
             l
             for d in tos
-            for l in fetch_legs(hub, d, day, adults, currency, ttl, fresh, status)
+            for l in fetch_legs(hub, d, day, adults, currency, ttl, fresh, status, src_list)
             if usable(l)
         ]
         for a in first_legs:
@@ -389,10 +453,10 @@ def options_table(title: str, options: list[Option], adults: int) -> Table:
             legs_txt.append(f"{l.airline:<14}", style="magenta")
             legs_txt.append(f" {l.origin}→{l.dest} ")
             legs_txt.append(f"{l.dep_hm}–{l.arr_hm}", style="yellow")
-            legs_txt.append(f"  £{l.price}", style="dim")
+            legs_txt.append(f"  {SYM}{l.price}", style="dim")
         conn = fmt_dur(o.connect_min) + f" @ {o.legs[0].dest}" if o.connect_min else "—"
         style = "on grey11" if i == 0 else ""
-        t.add_row(f"£{o.price}", o.route, legs_txt, conn, style=style)
+        t.add_row(f"{SYM}{o.price}", o.route, legs_txt, conn, style=style)
     if not options:
         t.add_row("—", "no viable options", "", "")
     return t
@@ -414,22 +478,24 @@ def print_booking_links(options: list[Option], adults: int, label: str = "") -> 
 
 def events_options() -> dict:
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text()).get(
-            "events", {"provider": "ibiza-spotlight"})
-    return {"provider": "ibiza-spotlight"}
+        return json.loads(CONFIG_PATH.read_text()).get("events", {"provider": "none"})
+    return {"provider": "none"}
 
 
 def fetch_events(day: str) -> list[dict]:
     """Party calendar for one date via the configured provider (cached 24h)."""
     opts = events_options()
-    name = opts.get("provider", "ibiza-spotlight")
+    name = opts.get("provider", "none")
     if name == "none":
         return []
     CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = CACHE_DIR / f"events-{name}-{day}.json"
+    cache_file = CACHE_DIR / f"events2-{name}-{day}.json"
+    ttl = 24.0
+    if CONFIG_PATH.exists():
+        ttl = json.loads(CONFIG_PATH.read_text()).get("cache_ttl_hours", 6) * 4
     if cache_file.exists():
         blob = json.loads(cache_file.read_text())
-        if (time.time() - blob["fetched_at"]) / 3600 <= 24:
+        if (time.time() - blob["fetched_at"]) / 3600 <= ttl:
             return blob["events"]
 
     events = providers.fetch(day, client(), opts)
@@ -462,7 +528,7 @@ def venue_tier(venue: str) -> int:
 def events_panel(day: str) -> Panel:
     events = fetch_events(day)
     lines = Text()
-    big = [e for e in events if any(v in e["venue"] for v in BIG_VENUES)]
+    big = [e for e in events if venue_tier(e["venue"]) == 1]
     rest = [e for e in events if e not in big]
     for e in big + rest:
         star = "★ " if e in big else "  "
@@ -471,8 +537,8 @@ def events_panel(day: str) -> Panel:
         lines.append(e["title"], style="cyan" if e in big else "dim cyan")
         if e["time"]:
             lines.append(f"  {e['time']}", style="dim")
-        if e["from_eur"]:
-            lines.append(f"  from €{e['from_eur']}", style="dim green")
+        if e["price_str"]:
+            lines.append(f"  {e['price_str']}", style="dim green")
         if e["djs"] and e in big:
             lines.append(f"\n    {', '.join(e['djs'])}", style="dim")
         lines.append("\n")
@@ -480,7 +546,7 @@ def events_panel(day: str) -> Panel:
         lines.append("nothing listed — check ibiza-spotlight.com manually", style="dim")
     return Panel(
         lines,
-        title=f"🎶 {nice_date(day)} — Ibiza party calendar ({len(events)} events)",
+        title=f"🎶 {nice_date(day)} — party calendar ({len(events)} events)",
         title_align="left",
         border_style="magenta",
     )
@@ -503,7 +569,7 @@ def html_report(
         return (
             f"<div class='leg'><span class='al'>{esc(l.airline)}</span> "
             f"{esc(l.origin)}→{esc(l.dest)} <span class='tm'>{l.dep_hm}–{l.arr_hm}</span> "
-            f"<span class='pr'>£{l.price}</span> "
+            f"<span class='pr'>{SYM}{l.price}</span> "
             f"<a href='{gf_link(l.origin, l.dest, l.date, adults)}' target='_blank'>search ↗</a></div>"
         )
 
@@ -516,19 +582,19 @@ def html_report(
         <div class="card {'win' if i == 0 else ''}">
           <div class="card-head">
             <span class="dates">{esc(nice_date(out_day))} → {esc(nice_date(back_day))}</span>
-            <span class="total">£{o.price + b.price}</span>{badge}
+            <span class="total">{SYM}{o.price + b.price}</span>{badge}
           </div>
-          <div class="dir"><h4>OUT · £{o.price}</h4>{''.join(leg_row(l) for l in o.legs)}{conn_o}</div>
-          <div class="dir"><h4>BACK · £{b.price}</h4>{''.join(leg_row(l) for l in b.legs)}{conn_b}</div>
+          <div class="dir"><h4>OUT · {SYM}{o.price}</h4>{''.join(leg_row(l) for l in o.legs)}{conn_o}</div>
+          <div class="dir"><h4>BACK · {SYM}{b.price}</h4>{''.join(leg_row(l) for l in b.legs)}{conn_b}</div>
         </div>""")
 
     ev_blocks = []
     for day, events in events_by_day.items():
         rows = []
         for e in events:
-            big = any(v in e["venue"] for v in BIG_VENUES)
+            big = venue_tier(e["venue"]) == 1
             djs = f"<div class='djs'>{esc(', '.join(e['djs']))}</div>" if e["djs"] and big else ""
-            price = f"<span class='pr'>from €{esc(e['from_eur'])}</span>" if e["from_eur"] else ""
+            price = f"<span class='pr'>{esc(e['price_str'])}</span>" if e["price_str"] else ""
             rows.append(
                 f"<div class='ev {'big' if big else ''}'><b>{esc(e['venue'])}</b>: "
                 f"{esc(e['title'])} <span class='tm'>{esc(e['time'])}</span> {price}{djs}</div>"
@@ -766,6 +832,9 @@ def render_dashboard(
     best = results[0]
     best_price = best["total"]
     max_price = max(r["total"] for r in results)
+    n_nights = (date_cls_diff := (datetime.strptime(best["bd"], "%Y-%m-%d")
+                - datetime.strptime(best["od"], "%Y-%m-%d")).days)
+    trip_label = "24-hour window" if n_nights == 1 else f"{n_nights}-night window"
 
     def tiered(day: str) -> tuple[list[dict], list[dict], list[dict]]:
         evs = events_by_day.get(day, [])
@@ -782,7 +851,7 @@ def render_dashboard(
           <div class="t-times">{leg.dep_hm} — {leg.arr_hm}</div>
         </div>
         <div class="t-stub">
-          <div class="t-price">£{leg.price}</div>
+          <div class="t-price">{SYM}{leg.price}</div>
           <a class="t-book" href="{gf_link(leg.origin, leg.dest, leg.date, adults)}">book</a>
           <div class="barcode"></div>
         </div>
@@ -797,13 +866,13 @@ def render_dashboard(
             for l in opt.legs)
         return (f'<div class="altrow"><span class="m">{esc(legs_m)}</span>'
                 f'<span class="via">{esc(via)} · lands {opt.legs[-1].arr_hm}</span>'
-                f'<span class="ap">£{opt.price}</span>{books}</div>')
+                f'<span class="ap">{SYM}{opt.price}</span>{books}</div>')
 
     def mini_leg(l: Leg, show_date: bool = False) -> str:
         d = f'{esc(dow(l.date))} ' if show_date else ""
         return (f'<div class="mini"><span class="m">{d}{l.dep_hm}–{l.arr_hm}</span> '
                 f'<b>{esc(l.origin)}→{esc(l.dest)}</b> '
-                f'<span class="m">{esc(l.airline)} · £{l.price}</span> '
+                f'<span class="m">{esc(l.airline)} · {SYM}{l.price}</span> '
                 f'<a href="{gf_link(l.origin, l.dest, l.date, adults)}">BOOK ↗</a></div>')
 
     def event_cards(day: str, mids: int | None = None, smalls: bool = True) -> str:
@@ -812,19 +881,19 @@ def render_dashboard(
             f"""<div class="ev-big"><div class="v">{esc(e["venue"])}</div>
               <div class="t">{esc(e["title"])}</div>
               {'<div class="d">' + esc(", ".join(e["djs"])) + '</div>' if e["djs"] else ''}
-              <div class="meta">{esc(e["time"])}{' · <b>from €' + esc(e["from_eur"]) + '</b>' if e["from_eur"] else ''}</div>
+              <div class="meta">{esc(e["time"])}{' · <b>' + esc(e["price_str"]) + '</b>' if e["price_str"] else ''}</div>
             </div>""" for e in t1
         ) + "".join(
             f"""<div class="ev-mid"><div class="v">{esc(e["venue"])}</div>
               <div class="t">{esc(e["title"])}</div>
               {'<div class="d">' + esc(", ".join(e["djs"])) + '</div>' if e["djs"] else ''}
-              <div class="meta">{esc(e["time"])}{' · <b>from €' + esc(e["from_eur"]) + '</b>' if e["from_eur"] else ''}</div>
+              <div class="meta">{esc(e["time"])}{' · <b>' + esc(e["price_str"]) + '</b>' if e["price_str"] else ''}</div>
             </div>""" for e in (t2 if mids is None else t2[:mids])
         )
         if smalls:
             out += "".join(
                 f'<div class="ev-small"><b>{esc(e["venue"])}</b> — {esc(e["title"])}'
-                f'{" · from €" + esc(e["from_eur"]) if e["from_eur"] else ""}</div>'
+                f'{" · " + esc(e["price_str"]) if e["price_str"] else ""}</div>'
                 for e in t3
             )
         return out
@@ -844,7 +913,7 @@ def render_dashboard(
         is_best = t == best_price
         top = " top" if t <= best_price * 1.25 else ""
         did = f"day-{od}"
-        delta = "cheapest" if is_best else f"+£{t - best_price}"
+        delta = "cheapest" if is_best else f"+{SYM}{t - best_price}"
         badge = '<span class="badge">CHEAPEST</span>' if is_best else ""
         barw = int(t / max_price * 100)
 
@@ -854,14 +923,14 @@ def render_dashboard(
         <span class="dates">{esc(nice_date(od))} – {esc(nice_date(bd))}{badge}
           <span class="lands">· lands {o.legs[-1].arr_hm}</span></span>
         <span class="head">{esc(headliners(od))}</span>
-        <span class="price"><span class="p">£{t}</span>
+        <span class="price"><span class="p">{SYM}{t}</span>
           <span class="delta">{esc(delta)}</span></span>
         <span class="bar"><i style="width:{barw}%"></i></span>
       </button>"""))
 
         def direction_block(label: str, opts: list[Option]) -> str:
             prim = opts[0]
-            parts = [f'<div class="seclabel">{esc(label)} · £{prim.price}</div>']
+            parts = [f'<div class="seclabel">{esc(label)} · {SYM}{prim.price}</div>']
             for i, leg in enumerate(prim.legs):
                 if i:
                     parts.append(f'<div class="hop">{fmt_dur(prim.connect_min or 0)} on the '
@@ -876,7 +945,7 @@ def render_dashboard(
     <section class="day-detail" id="{did}">
       <button class="dback" onclick="closeDay()"><span class="chev">←</span>
         <span class="t">{esc(nice_date(od))} – {esc(nice_date(bd))}</span>
-        <span class="p">£{t}</span></button>
+        <span class="p">{SYM}{t}</span></button>
       {direction_block("getting there", r["outs"])}
       {direction_block("getting home", r["backs"])}
       <div class="seclabel">your night · {esc(nice_date(od))}</div>
@@ -891,7 +960,7 @@ def render_dashboard(
         did = f"day-{od}"
         why = info.get("why", "no route")
         has_on = "overnight" in info
-        price_txt = f"£{info['overnight'][0]}*" if has_on else "—"
+        price_txt = f"{SYM}{info['overnight'][0]}*" if has_on else "—"
         rows.append((od, f"""
       <button class="row dead" onclick="openDay('{did}')">
         <span class="dow">{dow(od).upper()}<br>→{dow(bd).upper()}</span>
@@ -903,16 +972,16 @@ def render_dashboard(
         body = []
         if has_on:
             ot, oo, ob = info["overnight"]
-            body.append(f'<div class="seclabel">the overnight play · £{ot} + hotel</div>')
+            body.append(f'<div class="seclabel">the overnight play · {SYM}{ot} + hotel</div>')
             body.append(ticket(oo.legs[0]))
             body.append(f'<div class="hop">sleep in {esc(oo.legs[0].dest)} '
                         f'(hotel not priced)</div>')
             body.append(ticket(oo.legs[1]))
-            body.append(f'<div class="dsub">home · £{ob.price}</div>')
+            body.append(f'<div class="dsub">home · {SYM}{ob.price}</div>')
             body += [mini_leg(l) for l in ob.legs]
         if "late" in info:
             lt, lo, lb = info["late"]
-            body.append(f'<div class="seclabel">the late option · £{lt}</div>')
+            body.append(f'<div class="seclabel">the late option · {SYM}{lt}</div>')
             body += [mini_leg(l, show_date=True) for l in (*lo.legs, *lb.legs)]
         details.append(f"""
     <section class="day-detail" id="{did}">
@@ -929,9 +998,9 @@ def render_dashboard(
 
     pane_days = f"""
     <section id="pane-days" class="pane active">
-      <div class="intro" style="margin-top:.3rem">Every 24-hour window in your range,
-      priced for {adults}. Cheapest is <b>£{best_price}</b>
-      ({esc(nice_date(best["od"]))}), dearest £{max_price}. Tap a day for flights,
+      <div class="intro" style="margin-top:.3rem">Every {trip_label} in your range,
+      priced for {adults}. Cheapest is <b>{SYM}{best_price}</b>
+      ({esc(nice_date(best["od"]))}), dearest {SYM}{max_price}. Tap a day for flights,
       alternatives and what's on.</div>
       {"".join(h for _, h in rows)}
       <div class="tag">Greyed rows miss your land-by time — open them for the late
@@ -964,7 +1033,7 @@ def render_dashboard(
 <meta name="theme-color" content="#17132E">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>{esc(org)} → {esc(dst)} · from £{best_price}</title>
+<title>{esc(org)} → {esc(dst)} · from {SYM}{best_price}</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700;800&family=Space+Grotesk:wght@400;600&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
@@ -1024,6 +1093,7 @@ def load_config(args: argparse.Namespace) -> dict:
     cfg = json.loads(CONFIG_PATH.read_text())
     if getattr(args, "adults", None):
         cfg["adults"] = args.adults
+    set_currency(cfg.get("currency", "GBP"))
     return cfg
 
 
@@ -1031,40 +1101,71 @@ def cmd_init(args: argparse.Namespace) -> None:
     """Interactive config wizard."""
     from rich.prompt import Confirm, IntPrompt, Prompt
 
-    console.print(Panel("[bold]splitfare setup[/bold] — a few questions and "
-                        "you're hunting.", border_style="cyan"))
-    origins = Prompt.ask("Home airport code(s), comma-separated", default="BFS")
-    dest = Prompt.ask("Destination airport code(s)", default="IBZ")
+    console.print(Panel(
+        "[bold]splitfare setup[/bold] — a few questions and you're hunting.\n"
+        "[dim]Airport codes are IATA codes (the 3 letters on your boarding "
+        "pass): LGW = London Gatwick, BER = Berlin, LIS = Lisbon…[/dim]",
+        border_style="cyan"))
+    origins = Prompt.ask("Home airport code(s), comma-separated (e.g. LGW,STN)")
+    dest = Prompt.ask("Destination airport code(s) (e.g. LIS)")
     adults = IntPrompt.ask("Party size (adults)", default=2)
-    hubs = Prompt.ask(
-        "Self-transfer hub airports (comma-separated)",
-        default="LPL,MAN,LTN,STN,LGW,BHX,BRS,LBA,NCL,EDI,GLA,DUB")
-    currency = Prompt.ask("Currency", default="GBP")
-    connect = IntPrompt.ask("Minimum self-transfer connection (minutes)", default=120)
-    ev = Prompt.ask("Events provider", default="ibiza-spotlight",
+    console.print(
+        "\n[bold]Hubs[/bold] are the airports split tickets connect through — "
+        "pick 5-10 airports\nwith [bold]cheap budget-airline service from BOTH "
+        "your home and your destination[/bold]\n(think Ryanair/easyJet/Wizz "
+        "bases: e.g. STN, LTN, BCN, MXP-BGY, VIE, WAW…).\nMore hubs = more "
+        "combos found, but slower scans.\n")
+    hubs = Prompt.ask("Hub airport codes, comma-separated (empty = direct-only)",
+                      default="")
+    currency = Prompt.ask("Currency", default="EUR")
+    connect = IntPrompt.ask(
+        "Minimum self-transfer connection in minutes (separate tickets — "
+        "bigger is safer)", default=120)
+    ryanair = Confirm.ask(
+        "Add Ryanair's public fare API as a fallback source?", default=True)
+    console.print(
+        "\n[dim]Events providers: [bold]resident-advisor[/bold] = clubbing, "
+        "worldwide · [bold]ticketmaster[/bold]/[bold]skiddle[/bold] = gigs "
+        "(free API key needed) · [bold]ibiza-spotlight[/bold] = Ibiza only · "
+        "[bold]none[/bold] = flights only[/dim]")
+    ev = Prompt.ask("Events provider", default="none",
                     choices=sorted(providers.PROVIDERS))
     events: dict = {"provider": ev}
     if ev == "resident-advisor":
+        known = ", ".join(f"{k} {v}" for k, v in providers.RA_AREAS.items())
         events["area_id"] = IntPrompt.ask(
-            "RA area id (ra.co network tab; Ibiza 25, London 13, Berlin 34)",
+            f"RA area id ({known}; others: ra.co → your city → network tab)",
             default=25)
+    if ev == "ticketmaster":
+        events["city"] = Prompt.ask("City name for Ticketmaster search")
+        console.print("[dim]put your free key in $TICKETMASTER_API_KEY[/dim]")
+    if ev == "skiddle":
+        console.print("[dim]put your free key in $SKIDDLE_API_KEY; add "
+                      "latitude/longitude/radius_miles to config.json to "
+                      "narrow the area[/dim]")
 
     cfg = {
-        "origins": [s.strip().upper() for s in origins.split(",")],
-        "destination": [s.strip().upper() for s in dest.split(",")],
-        "hubs": [s.strip().upper() for s in hubs.split(",")],
+        "origins": [s.strip().upper() for s in origins.split(",") if s.strip()],
+        "destination": [s.strip().upper() for s in dest.split(",") if s.strip()],
+        "hubs": [s.strip().upper() for s in hubs.split(",") if s.strip()],
         "adults": adults,
-        "currency": currency,
+        "currency": currency.upper(),
         "min_connect_minutes": connect,
         "cache_ttl_hours": 6,
+        "flight_sources": ["google", "ryanair"] if ryanair else ["google"],
         "events": events,
     }
+    if not cfg["origins"] or not cfg["destination"]:
+        console.print("[red]origins and destination are required — run init "
+                      "again.[/red]")
+        return
     if CONFIG_PATH.exists() and not Confirm.ask("config.json exists — overwrite?"):
         console.print("[dim]left as it was.[/dim]")
         return
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    fri = date.today() + timedelta(days=(4 - date.today().weekday()) % 7 + 28)
     console.print(f"[green]✓[/green] wrote {CONFIG_PATH.name} — try: "
-                  f"[bold]splitfare window 2026-08-16 2026-08-17[/bold]")
+                  f"[bold]splitfare window {fri} {fri + timedelta(days=1)}[/bold]")
 
 
 def header(cfg: dict, hubs: list[str]) -> None:
@@ -1098,9 +1199,9 @@ def cmd_window(args: argparse.Namespace) -> None:
     if outs and backs:
         o, b = outs[0], backs[0]
         console.print(Panel(
-            f"[bold green]£{o.price + b.price} total[/bold green] for {cfg['adults']} adults\n"
-            f"[bold]OUT[/bold]  £{o.price:<5} {o.describe()}\n"
-            f"[bold]BACK[/bold] £{b.price:<5} {b.describe()}",
+            f"[bold green]{SYM}{o.price + b.price} total[/bold green] for {cfg['adults']} adults\n"
+            f"[bold]OUT[/bold]  {SYM}{o.price:<5} {o.describe()}\n"
+            f"[bold]BACK[/bold] {SYM}{b.price:<5} {b.describe()}",
             title="🏆 cheapest combination", title_align="left", border_style="green",
         ))
         print_booking_links(outs, cfg["adults"], "outbound")
@@ -1181,9 +1282,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
             note = "" if missing == 0 else f"needs split × {missing}"
             sweep.add_row(
                 f"{nice_date(out_day)} → {nice_date(back_day)}",
-                f"£{o}" if o is not None else "[dim]—[/dim]",
-                f"£{b}" if b is not None else "[dim]—[/dim]",
-                f"[dim]~£{estimate} · {note}[/dim]" if note else f"[dim]£{estimate}[/dim]",
+                f"{SYM}{o}" if o is not None else "[dim]—[/dim]",
+                f"{SYM}{b}" if b is not None else "[dim]—[/dim]",
+                f"[dim]~{SYM}{estimate} · {note}[/dim]" if note else f"[dim]{SYM}{estimate}[/dim]",
             )
     console.print(sweep)
 
@@ -1220,9 +1321,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
         conn_o = f"  [dim](connect {fmt_dur(o.connect_min)})[/dim]" if o.connect_min else ""
         conn_b = f"  [dim](connect {fmt_dur(b.connect_min)})[/dim]" if b.connect_min else ""
         parts.append(
-            f"[{style}]{marker}£{total}  {nice_date(out_day)} → {nice_date(back_day)}[/{style}]\n"
-            f"   OUT  £{o.price:<5} {o.describe()}{conn_o}\n"
-            f"   BACK £{b.price:<5} {b.describe()}{conn_b}"
+            f"[{style}]{marker}{SYM}{total}  {nice_date(out_day)} → {nice_date(back_day)}[/{style}]\n"
+            f"   OUT  {SYM}{o.price:<5} {o.describe()}{conn_o}\n"
+            f"   BACK {SYM}{b.price:<5} {b.describe()}{conn_b}"
         )
     console.print(Panel("\n\n".join(parts), title="Final ranking (cheapest first)",
                         title_align="left", border_style="green"))
@@ -1259,7 +1360,8 @@ def cmd_events(args: argparse.Namespace) -> None:
         console.print(events_panel((d0 + timedelta(days=i)).isoformat()))
 
 
-def two_pass_scan(cfg: dict, args: argparse.Namespace, hubs: list[str], status) -> list:
+def two_pass_scan(cfg: dict, args: argparse.Namespace, hubs: list[str],
+                  status) -> tuple[list, list]:
     """Quiet version of the scan pipeline; returns the deep-scan results."""
     dows = {s.strip().lower() for s in args.out_dow.split(",")} if args.out_dow else None
     arrive_by = hhmm_to_min(args.arrive_by) if args.arrive_by else None
@@ -1310,11 +1412,11 @@ def two_pass_scan(cfg: dict, args: argparse.Namespace, hubs: list[str], status) 
             if u_outs and u_backs:
                 t = u_outs[0].price + u_backs[0].price
                 if not outs:
-                    info["why"] = (f"£{t} exists but lands "
+                    info["why"] = (f"{SYM}{t} exists but lands "
                                    f"{u_outs[0].legs[-1].arr_hm} — after your cutoff")
                     info["late"] = (t, u_outs[0], u_backs[0])
                 else:
-                    info["why"] = (f"£{t} exists but gets home "
+                    info["why"] = (f"{SYM}{t} exists but gets home "
                                    f"{u_backs[0].legs[-1].arr_hm} — after your cutoff")
                     info["late"] = (t, u_outs[0], u_backs[0])
             if not outs and backs:
@@ -1338,7 +1440,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
         if not results:
             console.print("[yellow]No complete window found — nothing to publish.[/yellow]")
             return
-        status.update("[dim]fetching Ibiza events…[/dim]")
+        status.update("[dim]fetching destination events…[/dim]")
         days_needed = sorted({d for r in results for d in (r["od"], r["bd"])})
         events_by_day = {d: fetch_events(d) for d in days_needed}
 
@@ -1348,7 +1450,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     site.mkdir(exist_ok=True)
     (site / "index.html").write_text(page)
     console.print(f"[green]✓[/green] dashboard written to site/index.html "
-                  f"(cheapest £{results[0]['total']}, "
+                  f"(cheapest {SYM}{results[0]['total']}, "
                   f"{nice_date(results[0]['od'])} → {nice_date(results[0]['bd'])})")
 
     if args.deploy:
@@ -1370,10 +1472,10 @@ Answer the user's question by RUNNING the tool with Bash, then give a short,
 concrete answer (flights, times, total prices, and any caveats). Prices are
 totals for the whole party.
 
-Run commands from this directory using exactly this interpreter:
-  .venv/bin/python splitfare.py window OUT_DATE BACK_DATE [--events] [--top N] [--adults N] [--arrive-by HH:MM] [--home-by HH:MM]
-  .venv/bin/python splitfare.py scan --month YYYY-MM [--nights N] [--out-dow thu,fri] [--deep N] [--adults N] [--arrive-by HH:MM] [--home-by HH:MM] [--html FILE]
-  .venv/bin/python splitfare.py events YYYY-MM-DD [--days N]
+Run commands with exactly this executable:
+  {SPLITFARE_CMD} window OUT_DATE BACK_DATE [--events] [--top N] [--adults N] [--arrive-by HH:MM] [--home-by HH:MM]
+  {SPLITFARE_CMD} scan --month YYYY-MM [--nights N] [--out-dow thu,fri] [--deep N] [--adults N] [--arrive-by HH:MM] [--home-by HH:MM] [--html FILE]
+  {SPLITFARE_CMD} events YYYY-MM-DD [--days N]
 
 Notes: results are cached 6h so repeat runs are fast; a full uncached scan can
 take minutes — prefer `window` for specific dates. --arrive-by caps the
@@ -1387,16 +1489,18 @@ def cmd_ask(args: argparse.Namespace) -> None:
     import subprocess
 
     question = " ".join(args.question)
-    prompt = ASK_BRIEF + CONFIG_PATH.read_text() + f"\nQuestion: {question}"
+    runner = f"{sys.executable} {Path(__file__).resolve()}"
+    prompt = (ASK_BRIEF.replace("{SPLITFARE_CMD}", runner)
+              + CONFIG_PATH.read_text() + f"\nQuestion: {question}")
     cmd = [
         "claude", "-p", prompt,
-        "--allowedTools", "Bash(.venv/bin/python splitfare.py:*)",
+        "--allowedTools", f"Bash({runner}:*)",
     ]
     if args.model:
         cmd += ["--model", args.model]
     console.print(f"[dim]asking claude ({args.model or 'default model'})…[/dim]")
     try:
-        subprocess.run(cmd, cwd=ROOT, check=False)
+        subprocess.run(cmd, cwd=HOME_DIR, check=False)
     except FileNotFoundError:
         console.print(
             "[bold red]claude CLI not found[/bold red] — install Claude Code "
@@ -1423,14 +1527,14 @@ def print_welcome() -> None:
     console.print(Panel(
         f"[bold]splitfare[/bold] — cheap flight-combo hunter {setup}\n\n"
         "[bold cyan]Ask in plain English (easiest):[/bold cyan]\n"
-        '  splitfare ask [green]"cheapest 24hrs in september for 2, landing before 2pm"[/green]\n\n'
+        '  splitfare ask [green]"cheapest weekend next month for 2, landing before 2pm"[/green]\n\n'
         "[bold cyan]Or run it directly:[/bold cyan]\n"
-        "  splitfare [yellow]window[/yellow] 2026-08-23 2026-08-24 [dim]--events[/dim]     "
+        "  splitfare [yellow]window[/yellow] OUT-DATE BACK-DATE [dim]--events[/dim]        "
         "[dim]# price specific dates + party calendar[/dim]\n"
-        "  splitfare [yellow]scan[/yellow] --month 2026-09 [dim]--arrive-by 14:00[/dim]      "
+        "  splitfare [yellow]scan[/yellow] --month YYYY-MM [dim]--arrive-by 14:00[/dim]      "
         "[dim]# find the cheapest dates in a month[/dim]\n"
-        "  splitfare [yellow]events[/yellow] 2026-08-23                       "
-        "[dim]# what's on in Ibiza that day[/dim]\n\n"
+        "  splitfare [yellow]events[/yellow] YYYY-MM-DD                       "
+        "[dim]# what's on at the destination[/dim]\n\n"
         "[dim]Handy flags: --adults 2 · --arrive-by HH:MM · --home-by HH:MM · "
         "--html report.html · --fresh (ignore cache)\n"
         "Full help: splitfare --help  ·  per-command: splitfare scan --help[/dim]",
@@ -1458,7 +1562,7 @@ def main() -> None:
     w.add_argument("--arrive-by", metavar="HH:MM", help="outbound must land by this time")
     w.add_argument("--home-by", metavar="HH:MM", help="return must land by this time")
     w.add_argument("--fresh", action="store_true", help="ignore cache")
-    w.add_argument("--events", action="store_true", help="show Ibiza events for both dates")
+    w.add_argument("--events", action="store_true", help="show destination events for both dates")
     w.add_argument("--html", metavar="FILE", help="write a shareable HTML report")
     w.set_defaults(func=cmd_window)
 
@@ -1476,7 +1580,7 @@ def main() -> None:
     s.add_argument("--html", metavar="FILE", help="write a shareable HTML report")
     s.set_defaults(func=cmd_scan)
 
-    e = sub.add_parser("events", help="Ibiza Spotlight party calendar")
+    e = sub.add_parser("events", help="destination party calendar")
     e.add_argument("date", type=valid_date, help="YYYY-MM-DD")
     e.add_argument("--days", type=int, default=1)
     e.set_defaults(func=cmd_events)

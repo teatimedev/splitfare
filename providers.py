@@ -1,7 +1,7 @@
 """Event-calendar providers for splitfare.
 
 Each provider takes (day, http, options) and returns a list of event dicts:
-  {"title": str, "venue": str, "time": str, "from_eur": str, "djs": [str]}
+  {"title": str, "venue": str, "time": str, "price_str": str, "djs": [str]}
 
 Select one in config.json:
   "events": {"provider": "ibiza-spotlight"}
@@ -29,7 +29,7 @@ def provider(name: str):
 
 
 def fetch(day: str, http, options: dict) -> list[dict]:
-    name = options.get("provider", "ibiza-spotlight")
+    name = options.get("provider", "none")
     fn = PROVIDERS.get(name)
     if fn is None:
         raise ValueError(
@@ -66,7 +66,8 @@ def ibiza_spotlight(day: str, http, options: dict) -> list[dict]:
             "title": title_node.text(strip=True),
             "venue": venue_node.attributes.get("alt", "?") if venue_node else "?",
             "time": when,
-            "from_eur": price_node.text(strip=True) if price_node else "",
+            "price_str": (f"from €{price_node.text(strip=True)}"
+                          if price_node else ""),
             "djs": [n.text(strip=True) for n in card.css(".partyDj a")][:6],
         })
     return events
@@ -115,7 +116,110 @@ def resident_advisor(day: str, http, options: dict) -> list[dict]:
             "title": title,
             "venue": (e.get("venue") or {}).get("name", "?"),
             "time": f"{start}–{end}" if start else "",
-            "from_eur": "",
+            "price_str": "",
             "djs": [a["name"] for a in (e.get("artists") or [])][:6],
+        })
+    return events
+
+
+# Verified live area ids (ra.co GraphQL), for the init wizard and docs:
+RA_AREAS = {"ibiza": 25, "london": 13, "berlin": 34, "barcelona": 20}
+
+
+def _env_key(options: dict, default_env: str):
+    import os
+    env = options.get("api_key_env", default_env)
+    key = os.environ.get(env)
+    if not key:
+        raise ValueError(
+            f"events provider needs an API key in ${env} — free signup; "
+            "see README events-providers table")
+    return key
+
+
+@provider("ticketmaster")
+def ticketmaster(day: str, http, options: dict) -> list[dict]:
+    """Ticketmaster Discovery v2 (free key, 5k calls/day; concerts/festivals
+    worldwide — thin on underground club nights). options: api_key_env
+    (default TICKETMASTER_API_KEY), city, country_code, classification."""
+    key = _env_key(options, "TICKETMASTER_API_KEY")
+    params = {
+        "apikey": key,
+        "startDateTime": f"{day}T00:00:00Z",
+        "endDateTime": f"{day}T23:59:59Z",
+        "size": "50",
+        "sort": "date,asc",
+        "classificationName": options.get("classification", "music"),
+    }
+    if options.get("city"):
+        params["city"] = options["city"]
+    if options.get("country_code"):
+        params["countryCode"] = options["country_code"]
+    r = http.get("https://app.ticketmaster.com/discovery/v2/events.json",
+                 params=params)
+    if r.status_code != 200:
+        return []
+    return parse_ticketmaster(r.text)
+
+
+def parse_ticketmaster(text: str) -> list[dict]:
+    try:
+        data = json.loads(text)
+        rows = data.get("_embedded", {}).get("events", [])
+    except json.JSONDecodeError:
+        return []
+    events = []
+    for e in rows:
+        venues = e.get("_embedded", {}).get("venues", [])
+        acts = e.get("_embedded", {}).get("attractions", [])
+        pr = (e.get("priceRanges") or [{}])[0]
+        price = ""
+        if pr.get("min") is not None:
+            price = f"from {pr.get('currency', '')} {pr['min']:g}".replace("  ", " ")
+        start = e.get("dates", {}).get("start", {}).get("localTime", "")[:5]
+        events.append({
+            "title": e.get("name", "?"),
+            "venue": venues[0].get("name", "?") if venues else "?",
+            "time": start,
+            "price_str": price,
+            "djs": [a.get("name", "") for a in acts][:6],
+        })
+    return events
+
+
+@provider("skiddle")
+def skiddle(day: str, http, options: dict) -> list[dict]:
+    """Skiddle (free key; UK clubbing/gigs). options: api_key_env (default
+    SKIDDLE_API_KEY), latitude, longitude, radius_miles, eventcode (CLUB)."""
+    key = _env_key(options, "SKIDDLE_API_KEY")
+    params = {
+        "api_key": key, "minDate": day, "maxDate": day,
+        "limit": "50", "order": "trending",
+        "eventcode": options.get("eventcode", "CLUB"),
+    }
+    for src_k, dst_k in (("latitude", "latitude"), ("longitude", "longitude"),
+                         ("radius_miles", "radius")):
+        if options.get(src_k) is not None:
+            params[dst_k] = str(options[src_k])
+    r = http.get("https://www.skiddle.com/api/v1/events/search/", params=params)
+    if r.status_code != 200:
+        return []
+    return parse_skiddle(r.text)
+
+
+def parse_skiddle(text: str) -> list[dict]:
+    try:
+        rows = json.loads(text).get("results", [])
+    except json.JSONDecodeError:
+        return []
+    events = []
+    for e in rows:
+        price = e.get("entryprice") or ""
+        events.append({
+            "title": e.get("eventname", "?"),
+            "venue": (e.get("venue") or {}).get("name", "?"),
+            "time": (e.get("openingtimes") or {}).get("doorsopen", ""),
+            "price_str": price if isinstance(price, str) else "",
+            "djs": [a.get("name", "") for a in (e.get("artists") or [])][:6],
         })
     return events
