@@ -1,0 +1,33 @@
+name: Exact Diophantine research
+
+on:
+  push:
+    branches:
+      - research/diophantine-sage-20260727
+  workflow_dispatch:
+
+jobs:
+  sage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [conics, e1, e2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull SageMath
+        run: docker pull sagemath/sagemath:latest
+      - name: Run ${{ matrix.mode }} exact search
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
+            sage research/diophantine_search.sage "${{ matrix.mode }}" \
+            | tee "research/results-${{ matrix.mode }}.jsonl"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-diophantine-${{ matrix.mode }}
+          path: research/results-${{ matrix.mode }}.jsonl
+          if-no-files-found: warn
