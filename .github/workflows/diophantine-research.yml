@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - 'research/diophantine_search.sage'
+      - 'research/eplus_search.sage'
       - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
@@ -34,4 +35,29 @@ jobs:
         with:
           name: exact-diophantine-${{ matrix.mode }}
           path: research/results-${{ matrix.mode }}.jsonl
+          if-no-files-found: warn
+
+  positive-norm-family:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        multiple: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull SageMath
+        run: docker pull sagemath/sagemath:latest
+      - name: Search family member ${{ matrix.multiple }}
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
+            sage research/eplus_search.sage "${{ matrix.multiple }}" \
+            | tee "research/results-eplus-${{ matrix.multiple }}.jsonl"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-eplus-${{ matrix.multiple }}
+          path: research/results-eplus-${{ matrix.multiple }}.jsonl
           if-no-files-found: warn
