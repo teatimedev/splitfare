@@ -8,6 +8,7 @@ on:
     paths:
       - 'research/diophantine_search.sage'
       - 'research/eplus_search.sage'
+      - 'research/lambda_curve_search.sage'
       - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
@@ -60,4 +61,29 @@ jobs:
         with:
           name: exact-eplus-${{ matrix.multiple }}
           path: research/results-eplus-${{ matrix.multiple }}.jsonl
+          if-no-files-found: warn
+
+  scaled-factor-curves:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        code: ['2', '3', '5_3', '34_15', '25_41', '58_101', '87_101', '9129_3943', '4250453_7007642']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull SageMath
+        run: docker pull sagemath/sagemath:latest
+      - name: Search scaled factor curve ${{ matrix.code }}
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
+            sage research/lambda_curve_search.sage "${{ matrix.code }}" \
+            | tee "research/results-lambda-${{ matrix.code }}.jsonl"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-lambda-${{ matrix.code }}
+          path: research/results-lambda-${{ matrix.code }}.jsonl
           if-no-files-found: warn
