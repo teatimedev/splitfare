@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - research/diophantine-sage-20260727
+  pull_request:
+    paths:
+      - 'research/diophantine_search.sage'
+      - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
 jobs:
