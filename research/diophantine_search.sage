@@ -34,7 +34,7 @@ def map_e2(P):
     if u.denominator()!=1: return None
     u=ZZ(u); y=u+8; x=3*u-7
     r=(380-U)/148
-    w=74+QQ(71,37)*u+r*u*u
+    w=74+(QQ(71)/37)*u+r*u*u
     if w.denominator()!=1: return None
     w=ZZ(w)
     if (w-y*y)%2: return None
@@ -71,7 +71,7 @@ def lattice(E, gens, bound, mapper, label):
 
 def conics():
     E=EllipticCurve([0,0,0,0,-2]); P=E(3,5)
-    emit('mordell',rank=int(E.rank(proof=True)),gens=[str(Q) for Q in E.gens(proof=True)])
+    emit('mordell',rank=int(E.rank()),gens=[str(Q) for Q in E.gens()])
     for n in range(1,31):
         Q=n*P; k,v=QQ(Q[0]),QQ(Q[1]); w=abs(v); C=-k**6+40*k**3+32
         Cn=Conic(QQ,[3*k*k*w*w,-4*w**3,-C]); t=time.time()
@@ -82,8 +82,8 @@ def conics():
             emit('conic_error',multiple=n,error=repr(ex),seconds=time.time()-t)
 
 def e1():
-    E=EllipticCurve([0,0,1,-1,6]); t=time.time(); gens=E.gens(proof=True)
-    emit('curve',label='E1',rank=int(E.rank(proof=True)),gens=[str(P) for P in gens],torsion=[str(P) for P in E.torsion_points()],seconds=time.time()-t)
+    E=EllipticCurve([0,0,1,-1,6]); t=time.time(); gens=E.gens()
+    emit('curve',label='E1',rank=int(E.rank()),gens=[str(P) for P in gens],torsion=[str(P) for P in E.torsion_points()],seconds=time.time()-t)
     try:
         pts=E.integral_points(both_signs=True)
         emit('integral_points',label='E1',count=len(pts),points=[str(P) for P in pts])
@@ -95,9 +95,9 @@ def e1():
 
 def e2():
     E=EllipticCurve([0,0,0,-476688,133008912]); t=time.time()
-    known=[E(132,8508),E(QQ(23796,121),QQ(9112140,1331)),E(QQ(18369,49),QQ(-906975,343)),E(276,-4740),E(QQ(311724,1369),QQ(-305064180,50653))]
+    known=[E(132,8508),E(QQ(23796)/121,QQ(9112140)/1331),E(QQ(18369)/49,QQ(-906975)/343),E(276,-4740),E(QQ(311724)/1369,QQ(-305064180)/50653)]
     try:
-        gens=E.gens(proof=True); rank=E.rank(proof=True)
+        gens=E.gens(); rank=E.rank()
         emit('curve',label='E2',rank=int(rank),gens=[str(P) for P in gens],torsion=[str(P) for P in E.torsion_points()],seconds=time.time()-t)
     except Exception as ex:
         emit('curve_error',label='E2',error=repr(ex),seconds=time.time()-t); gens=known
