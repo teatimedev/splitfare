@@ -16,9 +16,17 @@ def verify(x, y, z):
 
 
 def local_obstruction(d):
-    # From d*y^2 = x^3+d^2-2, every p|d requires x^3=2 (mod p).
-    for p, _ in factor(abs(d)):
-        p = ZZ(p)
+    # Every solution has a companion with negative z, so only d=-z>0 is needed.
+    if d < 0:
+        return -1
+    fd = factor(d)
+    # x^3=2 modulo 4 or 9 is impossible.
+    for p, e in fd:
+        p, e = ZZ(p), ZZ(e)
+        if p == 2 and e >= 2:
+            return 4
+        if p == 3 and e >= 2:
+            return 9
         if p in (2, 3) or p % 3 == 2:
             continue
         if power_mod(2, (p-1)//3, p) != 1:
