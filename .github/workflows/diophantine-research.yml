@@ -7,6 +7,10 @@ on:
     paths:
       - 'research/fixed_z_search.sage'
       - '.github/workflows/diophantine-research.yml'
+  pull_request:
+    paths:
+      - 'research/fixed_z_search.sage'
+      - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
 jobs:
