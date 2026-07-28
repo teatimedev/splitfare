@@ -1,89 +1,44 @@
-name: Exact Diophantine research
+name: Exact fixed-z Diophantine sweep
 
 on:
   push:
     branches:
       - research/diophantine-sage-20260727
-  pull_request:
     paths:
-      - 'research/diophantine_search.sage'
-      - 'research/eplus_search.sage'
-      - 'research/lambda_curve_search.sage'
+      - 'research/fixed_z_search.sage'
       - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
 jobs:
-  sage:
+  fixed-z:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        mode: [conics, e1, e2]
+        include:
+          - {start: -200, end: -151}
+          - {start: -150, end: -101}
+          - {start: -100, end: -51}
+          - {start: -50, end: -1}
+          - {start: 1, end: 50}
+          - {start: 51, end: 100}
+          - {start: 101, end: 150}
+          - {start: 151, end: 200}
     steps:
       - uses: actions/checkout@v4
       - name: Pull SageMath
         run: docker pull sagemath/sagemath:latest
-      - name: Run ${{ matrix.mode }} exact search
+      - name: Run exact fixed-z sweep
         run: |
           set -o pipefail
           docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
-            sage research/diophantine_search.sage "${{ matrix.mode }}" \
-            | tee "research/results-${{ matrix.mode }}.jsonl"
-      - name: Upload results
+            sage research/fixed_z_search.sage "${{ matrix.start }}" "${{ matrix.end }}" \
+            | tee "research/results-fixed-z-${{ matrix.start }}-${{ matrix.end }}.jsonl"
+      - name: Upload exact results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: exact-diophantine-${{ matrix.mode }}
-          path: research/results-${{ matrix.mode }}.jsonl
-          if-no-files-found: warn
-
-  positive-norm-family:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        multiple: [1, 2, 3, 4, 5, 6]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Pull SageMath
-        run: docker pull sagemath/sagemath:latest
-      - name: Search family member ${{ matrix.multiple }}
-        run: |
-          set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
-            sage research/eplus_search.sage "${{ matrix.multiple }}" \
-            | tee "research/results-eplus-${{ matrix.multiple }}.jsonl"
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: exact-eplus-${{ matrix.multiple }}
-          path: research/results-eplus-${{ matrix.multiple }}.jsonl
-          if-no-files-found: warn
-
-  scaled-factor-curves:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        code: ['2', '3', '5_3', '34_15', '25_41', '58_101', '87_101', '9129_3943', '4250453_7007642']
-    steps:
-      - uses: actions/checkout@v4
-      - name: Pull SageMath
-        run: docker pull sagemath/sagemath:latest
-      - name: Search scaled factor curve ${{ matrix.code }}
-        run: |
-          set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
-            sage research/lambda_curve_search.sage "${{ matrix.code }}" \
-            | tee "research/results-lambda-${{ matrix.code }}.jsonl"
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: exact-lambda-${{ matrix.code }}
-          path: research/results-lambda-${{ matrix.code }}.jsonl
+          name: fixed-z-${{ matrix.start }}-${{ matrix.end }}
+          path: research/results-fixed-z-${{ matrix.start }}-${{ matrix.end }}.jsonl
           if-no-files-found: warn
