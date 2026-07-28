@@ -13,6 +13,10 @@ on:
       - '.github/workflows/diophantine-research.yml'
   workflow_dispatch:
 
+concurrency:
+  group: exact-fixed-z-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fixed-z:
     runs-on: ubuntu-latest
@@ -21,10 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {start: -200, end: -151}
-          - {start: -150, end: -101}
-          - {start: -100, end: -51}
-          - {start: -50, end: -1}
           - {start: 1, end: 50}
           - {start: 51, end: 100}
           - {start: 101, end: 150}
