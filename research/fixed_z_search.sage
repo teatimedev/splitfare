@@ -1,6 +1,6 @@
 #!/usr/bin/env sage
 from sage.all import *
-import json, sys, time
+import itertools, json, sys, time
 
 proof.all(False)
 start = ZZ(sys.argv[1])
@@ -15,9 +15,25 @@ def verify(x, y, z):
     return z*z + y*y*z + x*x*x - 2 == 0
 
 
+def local_obstruction(d):
+    # From d*y^2 = x^3+d^2-2, every p|d requires x^3=2 (mod p).
+    for p, _ in factor(abs(d)):
+        p = ZZ(p)
+        if p in (2, 3) or p % 3 == 2:
+            continue
+        if power_mod(2, (p-1)//3, p) != 1:
+            return p
+    return None
+
+
 for d in range(start, end + 1):
     if d == 0:
         continue
+    obstruction = local_obstruction(d)
+    if obstruction is not None:
+        emit("local_skip", d=int(d), obstruction=int(obstruction))
+        continue
+
     t0 = time.time()
     c = d**3 * (d**2 - 2)
     E = EllipticCurve([0, 0, 0, 0, c])
@@ -30,14 +46,11 @@ for d in range(start, end + 1):
         emit("rank_error", d=int(d), error=repr(exc), seconds=time.time()-t0)
         continue
 
-    # A bounded lattice pass catches points even when a complete integral-point
-    # computation is expensive. Every hit is independently verified.
     bound = 150 if len(gens) == 1 else (35 if len(gens) == 2 else (10 if len(gens) == 3 else 4))
     seen = set()
     try:
         if gens:
             ranges = [range(-bound, bound + 1) for _ in gens]
-            import itertools
             for coeffs in itertools.product(*ranges):
                 if all(n == 0 for n in coeffs):
                     continue
@@ -61,7 +74,6 @@ for d in range(start, end + 1):
     except Exception as exc:
         emit("lattice_error", d=int(d), error=repr(exc))
 
-    # Sage's elliptic-logarithm routine gives a complete list when it succeeds.
     try:
         pts = E.integral_points(both_signs=True)
         emit("integral_points", d=int(d), count=len(pts))
