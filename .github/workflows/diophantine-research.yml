@@ -1,0 +1,48 @@
+name: Exact fixed-z Diophantine sweep
+
+on:
+  push:
+    branches:
+      - research/diophantine-sage-20260727
+    paths:
+      - 'research/fixed_z_search.sage'
+      - '.github/workflows/diophantine-research.yml'
+  pull_request:
+    paths:
+      - 'research/fixed_z_search.sage'
+      - '.github/workflows/diophantine-research.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: exact-fixed-z-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fixed-z:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {start: 1, end: 50}
+          - {start: 51, end: 100}
+          - {start: 101, end: 150}
+          - {start: 151, end: 200}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull SageMath
+        run: docker pull sagemath/sagemath:latest
+      - name: Run exact fixed-z sweep
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work sagemath/sagemath:latest \
+            sage research/fixed_z_search.sage "${{ matrix.start }}" "${{ matrix.end }}" \
+            | tee "research/results-fixed-z-${{ matrix.start }}-${{ matrix.end }}.jsonl"
+      - name: Upload exact results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-z-${{ matrix.start }}-${{ matrix.end }}
+          path: research/results-fixed-z-${{ matrix.start }}-${{ matrix.end }}.jsonl
+          if-no-files-found: warn
