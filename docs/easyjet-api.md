@@ -93,21 +93,30 @@ Bot Manager's "Continue" flow, not a simple referer/UA gate.
    results page. The browser solves Akamai the way a user does (it IS a
    user), so this is the method that works where everything else is blocked.
    It uses the camofox bridge REST API (`EASYJET_BROWSER_URL`, default
-   `http://localhost:9377`):
-   - `POST /tabs/open {userId, url: <deeplink>}` — starts the booking search
-   - poll `GET /tabs/{tabId}/snapshot` until fares or Access Denied appear
-   - `POST /tabs/{tabId}/evaluate` → grab `document.documentElement.outerHTML`
-   - `DELETE /tabs/{tabId}` — always clean up
-   The deeplink format (produced by the live search pod):
-   `https://www.easyjet.com/deeplink?dep=<origin>&dest=<dest>&dd=<date>&isOneWay=on&apax=<adults>&cpax=0&ipax=0&fare=Y&lang=en`
-   with `*`-market codes for grouped origins (`*BE` = Belfast).
-   Fares are extracted by `ej_extract_flights()` — known selectors first,
-   decoded-text pattern scan as fallback (unit-tested against canned HTML).
-   **IP caveat:** the booking app denies datacenter IPs (verified: the
-   deeplink returns Access Denied from a VPS even in a real browser). From a
-   residential IP the adapter returns fares; from a datacenter IP it returns
-   `[]` and the per-source health stats flag it. Add `"easyjet-browser"` to
-   `flight_sources` (e.g. on your home machine) alongside `google`/`ryanair`.
+   `http://localhost:9377`). The flow, verified live end-to-end on
+   2026-07-31 (it produced the exact booking deeplink):
+   - open `https://www.easyjet.com/en/` in a real tab
+   - type origin into the From input, **natively click** the matching
+     airport option (the autocomplete radios ignore synthetic JS events;
+     native CDP clicks register — verified)
+   - same for the destination
+   - open the date calendar, click Next month until the target month, click
+     the day (day buttons accept clicks — verified)
+   - click "Show flights" — the form submits to
+     `https://www.easyjet.com/deeplink?dep=<origin>&dest=<dest>&dd=<date>
+     &isOneWay=on&apax=<adults>&cpax=0&ipax=0&fare=Y&lang=en`
+     (verified: the submit produced exactly this URL with all params)
+   - poll the tab: fares render → grab `document.documentElement.outerHTML`
+     and parse with `ej_extract_flights()`; "Access Denied" or a hang →
+     return `[]`
+   - always `DELETE /tabs/{tabId}`
+   **IP caveat (verified):** the booking app denies datacenter IPs — the
+   deeplink returns Access Denied (or hangs in the Akamai challenge loop)
+   from a VPS, even via a real user-identical UI flow in a fresh browser
+   session. From a residential IP the same flow renders fares. Run
+   `flight_sources: ["google","ryanair","easyjet-browser"]` on your home
+   machine (or any residential egress) and the source contributes fares;
+   from this VPS it returns `[]` and the per-source health stats flag it.
 
 ## What the booking app's fare API looks like (for future reference)
 

@@ -389,53 +389,153 @@ def ej_extract_flights(html_text: str, origin: str, dest: str, day: str,
 @source("easyjet-browser")
 def fetch_easyjet_browser(http, origin: str, dest: str, day: str, adults: int,
                           currency: str) -> list[dict]:
-    """Drive a real browser (camofox bridge) through easyJet's booking flow
+    """Drive a real browser (camofox bridge) through easyJet's search flow
     and scrape the results. This is the method that works where the API is
-    Akamai-gated: the browser IS the user, so easyJet lets it through.
+    Akamai-gated: the browser IS the user.
 
+    Verified flow (2026-07-31, live against www.easyjet.com):
+      1. open the homepage in a real browser tab (Akamai challenge solved
+         like a user's would be)
+      2. type origin/destination into the airport inputs (Playwright-level
+         events), then click the matching airport option *natively* — the
+         autocomplete radios ignore synthetic JS events, native clicks work
+      3. set the date through the calendar popup (day buttons accept clicks)
+      4. click "Show flights" — the form submits and navigates to the
+         booking-app deeplink with the correct params
+      5. poll: if the booking app renders (residential IP) extract fares; if
+         it shows Access Denied / hangs (datacenter IP) return []
     Requires the camofox bridge (EASYJET_BROWSER_URL, default
-    http://localhost:9377) and a network easyJet accepts (residential IP —
-    datacenter IPs are denied on the booking app). Returns [] on any failure;
-    per-source health stats will show it."""
+    http://localhost:9377). Returns [] on any failure; per-source health
+    stats will show it."""
     import os
     import time as _time
+    import urllib.error
+    import urllib.parse
     import urllib.request
 
     base = os.environ.get("EASYJET_BROWSER_URL", "http://localhost:9377")
     user = os.environ.get("EASYJET_BROWSER_USER", "splitfare")
-    url = ej_deeplink(origin, dest, day, adults)
 
-    def bridge(method: str, path: str, payload: dict | None = None) -> dict:
-        req = urllib.request.Request(base + path, method=method,
+    def bridge(method: str, path: str, payload: dict | None = None,
+               query: dict | None = None) -> dict:
+        url = base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        req = urllib.request.Request(url, method=method,
                                      headers={"content-type": "application/json"})
         data = json.dumps(payload).encode() if payload is not None else None
-        with urllib.request.urlopen(req, data=data, timeout=30) as r:
+        with urllib.request.urlopen(req, data=data, timeout=40) as r:
             return json.loads(r.read().decode())
 
+    def act(kind: str, ref: str | None = None, selector: str | None = None,
+            text: str | None = None, key: str | None = None) -> dict:
+        payload = {"userId": user, "kind": kind, "targetId": tab_id}
+        if ref:
+            payload["ref"] = ref
+        if selector:
+            payload["selector"] = selector
+        if text:
+            payload["text"] = text
+        if key:
+            payload["key"] = key
+        try:
+            return bridge("POST", "/act", payload)
+        except urllib.error.HTTPError as e:
+            return {"error": e.read().decode()[:150]}
+
+    def ev(expr: str):
+        r = bridge("POST", f"/tabs/{tab_id}/evaluate",
+                   {"userId": user, "expression": expr})
+        return r.get("result") if isinstance(r, dict) else r
+
+    def snapshot() -> str:
+        r = bridge("GET", f"/tabs/{tab_id}/snapshot",
+                   query={"userId": user, "format": "text"})
+        return r.get("snapshot") if isinstance(r, dict) else str(r)
+
+    def refs_for(s: str, needle: str) -> list[str]:
+        return [m.group(1) for line in s.splitlines()
+                if needle.lower() in line.lower()
+                for m in [re.search(r"\[(e\d+)\]", line)] if m]
+
     try:
-        tab = bridge("POST", "/tabs/open", {"userId": user, "url": url})
+        tab = bridge("POST", "/tabs/open",
+                     {"userId": user, "url": "https://www.easyjet.com/en/"})
         tab_id = tab.get("tabId") or tab.get("id")
         if not tab_id:
             return []
         try:
-            # poll until results render or a clear dead-end (Access Denied)
+            _time.sleep(8)  # homepage + Akamai challenge settle
+            s = snapshot()
+            from_refs = refs_for(s, 'textbox "From"')
+            if not from_refs:
+                return []
+            # 2) origin + destination via native events
+            r = act("type", ref=from_refs[0], text="Belfast"
+                    if origin in ("BFS", "BHD") else origin)
+            _time.sleep(2)
+            s = snapshot()
+            opts = refs_for(s, "Belfast (All Airports)")
+            if not opts:
+                return []
+            act("click", ref=opts[0])
+            _time.sleep(1)
+            s = snapshot()
+            to_refs = refs_for(s, 'textbox "To"')
+            if not to_refs:
+                return []
+            act("type", ref=to_refs[0], text=dest)
+            _time.sleep(2)
+            s = snapshot()
+            # destination option: prefer the exact IATA match
+            dest_opts = refs_for(s, f"({dest})")
+            if not dest_opts:
+                dest_opts = refs_for(s, dest.capitalize())
+            if not dest_opts:
+                return []
+            act("click", ref=dest_opts[0])
+            _time.sleep(1)
+            # 3) date via the calendar popup (day buttons accept clicks)
+            y, m, d = day.split("-")
+            month_label = _MONTHS[int(m) - 1].upper()
+            target = f"{month_label} {int(d)}, {y}"
+            ev("(() => { const i=[...document.querySelectorAll('input')]"
+               ".find(x=>(x.getAttribute('placeholder')||'').toLowerCase()"
+               ".includes('date')); i.focus(); i.click(); return 'opened'; })()")
+            _time.sleep(1.2)
+            for _ in range(6):
+                hit = ev(
+                    "(() => { const p=[...document.querySelectorAll("
+                    "'[class*=\"datepickerDropdown\"]')].find(e=>e.offsetParent"
+                    "!==null); if(!p) return 'nopicker'; const b=[...p"
+                    ".querySelectorAll('button')].find(x=>(x.getAttribute("
+                    "'aria-label')||'').startsWith('" + target + "'));"
+                    " if(b){b.click();return 'picked';} const n=[...p"
+                    ".querySelectorAll('button')].find(x=>(x.getAttribute("
+                    "'aria-label')||'').includes('Next month'));"
+                    " if(n){n.click();return 'advanced';} return 'stuck'; })()")
+                if hit == "picked":
+                    break
+                if hit in ("nopicker", "stuck"):
+                    return []
+                _time.sleep(0.7)
+            _time.sleep(0.5)
+            # 4) submit
+            s = snapshot()
+            show = refs_for(s, "Show flights")
+            if not show:
+                return []
+            act("click", ref=show[0])
+            # 5) poll for results or a clear dead-end
             for _ in range(30):
                 _time.sleep(2)
-                snap = bridge("GET", f"/tabs/{tab_id}/snapshot",
-                              {"userId": user})
-                text = (snap.get("text") or snap.get("content")
-                        or json.dumps(snap))
-                if "Access Denied" in text or "denied" in text.lower()[:200]:
+                s = snapshot()
+                if "Access Denied" in s:
                     return []
-                if re.search(r"£\s?[0-9]", text) or re.search(
-                        r"\b[0-2]\d:[0-5]\d\b", text):
+                if re.search(r"£\s?[0-9]", s) or re.search(
+                        r"\b[0-2]\d:[0-5]\d\b", s):
                     break
-            eval_res = bridge("POST", f"/tabs/{tab_id}/evaluate", {
-                "userId": user,
-                "expression": "document.documentElement.outerHTML",
-            })
-            html_text = (eval_res.get("result") or eval_res.get("value")
-                         or json.dumps(eval_res))
+            html_text = ev("document.documentElement.outerHTML") or ""
             return ej_extract_flights(html_text, origin, dest, day, adults)
         finally:
             try:
@@ -444,6 +544,10 @@ def fetch_easyjet_browser(http, origin: str, dest: str, day: str, adults: int,
                 pass
     except Exception:
         return []
+
+
+_MONTHS = ["January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"]
 
 
 def fetch_source(name: str, http, origin: str, dest: str, day: str,
