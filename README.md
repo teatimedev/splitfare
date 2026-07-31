@@ -164,7 +164,9 @@ refetches automatically when you add a source that wasn't there before.
 > sometimes block datacenter IPs (VPSes). If a source shows as empty in the
 > per-source health warning, run from a residential IP or drop it from
 > `flight_sources` — google alone still covers those carriers via the
-> aggregator.
+> aggregator. easyJet's current API (no public endpoint; Akamai-protected)
+> is reverse-engineered in [docs/easyjet-api.md](docs/easyjet-api.md), with
+> `EASYJET_COOKIES` session-cookie injection for residential use.
 
 For the curious: Amadeus retired its self-service API in 2026, Kiwi's Tequila
 closed to new signups, and Duffel doesn't carry Ryanair/Wizz — scraping the

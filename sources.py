@@ -20,8 +20,8 @@ Config: "flight_sources": ["google", "ryanair", "easyjet", "wizz"]
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 # max concurrent requests + per-request delay per source (politeness budget)
 SOURCE_LIMITS: dict[str, tuple[int, float]] = {
@@ -102,68 +102,126 @@ def fetch_ryanair(http, origin: str, dest: str, day: str, adults: int,
 
 # ------------------------------------------------------------------- easyjet
 
+# easyJet has no public API. The current fare surface (verified live
+# 2026-07-31, see docs/easyjet-api.md) is the homepage fare-calendar endpoint
+# behind Akamai bot protection: it only answers requests that ride a real
+# browser session that solved the challenge. From a residential IP with
+# session cookies injected this works; from a datacenter IP it returns empty
+# (per-source health stats will show it).
+#
+# Market-group codes: the site uses `*`-prefixed codes for grouped cities
+# (observed: *BE = Belfast). Plain IATA codes work for the destination and
+# for most origins; keep this map for the groups we've confirmed.
+EASYJET_MARKET_GROUPS = {"BFS": "*BE", "BHD": "*BE"}
+
+
+def _ej_cookies() -> str | None:
+    """Session cookies from a real browser that solved easyJet's Akamai
+    challenge. Points at a Netscape-cookie or JSON file via EASYJET_COOKIES."""
+    import os
+    path = os.environ.get("EASYJET_COOKIES")
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return None
+    # JSON shape: {"name": "value", ...} or [{"name","value"}, ...]
+    try:
+        import json as _json
+        data = _json.loads(text)
+        if isinstance(data, list):
+            return "; ".join(f"{c['name']}={c['value']}"
+                             for c in data if "name" in c)
+        if isinstance(data, dict):
+            return "; ".join(f"{k}={v}" for k, v in data.items())
+    except Exception:
+        pass
+    # Netscape cookies.txt shape: domain \t flag \t path \t secure \t exp \t name \t value
+    out = []
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            out.append(f"{parts[5]}={parts[6]}")
+    return "; ".join(out) if out else None
+
+
 @source("easyjet")
 def fetch_easyjet(http, origin: str, dest: str, day: str, adults: int,
                   currency: str) -> list[dict]:
-    """easyJet's public flightShopping endpoint (the one their site uses).
-    Per-person fares; multiply by party size. Best-effort."""
+    """easyJet's homepage fare-calendar endpoint (current as of 2026).
+
+    Requires a browser-grade session (Akamai). With EASYJET_COOKIES pointing
+    at session cookies from a real browser, this returns per-day fares for
+    Returns [] from an unprotected/datacenter context — the per-source health
+    stats will show the source as empty, which is the expected signal."""
     try:
-        session = str(uuid.uuid4()).upper()
-        r = http.post(
-            "https://www.easyjet.com/ejapi/fareQuote/flightShopping",
-            headers={
-                "content-type": "application/json",
-                "accept": "application/json",
-                "ej-session-id": session,
-                "user-agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/125.0 Safari/537.36"),
-            },
-            json={
-                "market": "uk",
-                "locale": "en-GB",
+        headers = {
+            "user-agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/125.0 Safari/537.36"),
+            "accept": "application/json, text/plain, */*",
+            "referer": "https://www.easyjet.com/en/",
+        }
+        cookies = _ej_cookies()
+        if cookies:
+            headers["cookie"] = cookies
+        origin_code = EASYJET_MARKET_GROUPS.get(origin.upper(), origin.upper())
+        r = http.get(
+            "https://www.easyjet.com/homepage/api/availability",
+            params={
+                "origin": origin_code,
+                "destination": dest.upper(),
                 "currency": currency,
-                "passengers": {"adults": adults, "children": 0, "infants": 0},
-                "outbound": {
-                    "departureAirportCode": origin,
-                    "destinationAirportCode": dest,
-                    "departureDate": day,
-                },
-                "inbound": None,
-                "isReturn": False,
-                "isChangeFlight": False,
-            })
+                "isReturn": "false",
+                "originMarketGroup": origin.upper(),
+                "startDate": day,
+                "endDate": day,
+                "isWorldwide": "false",
+            },
+            headers=headers)
         if r.status_code != 200:
             return []
         data = json.loads(r.text)
-        flights = ((data.get("outbound") or {}).get("flights")) or []
+        # the calendar returns per-day fare objects; tolerate both a bare
+        # list and a nested envelope without knowing the exact 200 shape
+        # (we could only observe the call, not its response, from the VPS)
+        rows = data if isinstance(data, list) else []
+        if not rows and isinstance(data, dict):
+            for key in ("availability", "fares", "days", "results", "data"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    rows = v
+                    break
     except Exception:
         return []
     legs = []
-    for fl in flights:
-        dep_iso = fl.get("departureDate") or ""
-        arr_iso = fl.get("arrivalDate") or ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dep_iso = (row.get("departureDate") or row.get("date") or row.get("day")
+                   or "")
         if not dep_iso.startswith(day):
             continue
-        fares = fl.get("fares") or []
-        if not fares:
+        price = (row.get("price") or row.get("amount") or row.get("fare"))
+        if isinstance(price, dict):
+            price = price.get("amount") or price.get("value")
+        if price is None:
             continue
-        # cheapest fare bucket
-        amount = None
-        for f in fares:
-            p = ((f.get("price") or {}).get("amount"))
-            if p is not None:
-                amount = min(amount, p) if amount is not None else p
-        if amount is None:
+        try:
+            amount = float(price)
+        except (TypeError, ValueError):
             continue
-        dep_min, _ = _hhmm(dep_iso)
-        arr_min, _ = _hhmm(arr_iso)
+        dep_min, _ = _hhmm(row.get("departureTime") or "")
+        arr_min, _ = _hhmm(row.get("arrivalTime") or "")
         legs.append({
-            "origin": fl.get("departureAirportCode") or origin,
-            "dest": fl.get("arrivalAirportCode") or dest,
+            "origin": row.get("departureAirportCode") or origin.upper(),
+            "dest": row.get("arrivalAirportCode") or dest.upper(),
             "date": day, "airline": "easyJet",
             "dep_min": dep_min, "arr_min": arr_min,
-            "arr_day_offset": _day_offset(day, dep_iso, arr_iso),
+            "arr_day_offset": 0,
             "price": round(amount * adults),
         })
     return legs
