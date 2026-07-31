@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp>=1.0,<2.0"]  # 2.x dropped mcp.server.fastmcp; server code targets 1.x
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -32,4 +32,4 @@ splitfare-mcp = "mcp_server:main"
 Repository = "https://github.com/teatimedev/splitfare"
 
 [tool.setuptools]
-py-modules = ["splitfare", "providers", "mcp_server"]
+py-modules = ["splitfare", "providers", "sources", "mcp_server"]

@@ -24,9 +24,12 @@ import html as html_mod
 import os
 import json
 import re
+import secrets
 import sys
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +46,7 @@ from fast_flights import FlightQuery, Passengers, create_query
 from fast_flights.parser import parse as gf_parse
 
 import providers
+import sources
 
 ROOT = Path(__file__).resolve().parent
 # Config, cache and the generated site live here; override with SPLITFARE_HOME
@@ -50,12 +54,22 @@ ROOT = Path(__file__).resolve().parent
 HOME_DIR = Path(os.environ.get("SPLITFARE_HOME", ROOT))
 CACHE_DIR = HOME_DIR / ".cache"
 CONFIG_PATH = HOME_DIR / "config.json"
+HISTORY_FILE = CACHE_DIR / "price_history.jsonl"  # append-only price observations
+WATCH_FILE = HOME_DIR / "watches.json"
 
 # Google's cookie-consent bypass: pre-consented SOCS cookie (EU wall otherwise
 # returns a page with no data script and parsing fails).
 SOCS = "CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg"
 
 POLITE_DELAY_S = 1.5
+
+# Per-source concurrency: (max workers, delay per request). Fetches run in a
+# thread pool so a month sweep is parallel, but each source keeps its own
+# politeness budget so we don't get blocked.
+SOURCE_SEMS = {name: threading.Semaphore(lim)
+               for name, (lim, _) in sources.SOURCE_LIMITS.items()}
+EXECUTOR = ThreadPoolExecutor(max_workers=14, thread_name_prefix="splitfare")
+_client_local = threading.local()
 
 CURRENCY_SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$", "SEK": "kr",
                     "DKK": "kr", "NOK": "kr", "PLN": "zł", "CHF": "CHF",
@@ -69,9 +83,9 @@ def set_currency(code: str) -> None:
 
 console = Console(highlight=False)
 
-# fetch health accounting — if Google starts stonewalling, most live fetches
-# come back empty and results silently look like "no flights"; we track and warn
-FETCH_STATS = {"live": 0, "live_empty": 0, "cached": 0}
+# fetch health accounting — per source: live fetches vs fetches that came
+# back empty (rate-limiting / parser breakage). We track and warn per source.
+FETCH_STATS: dict = {"cached": 0}
 
 
 # ---------------------------------------------------------------- data model
@@ -166,57 +180,41 @@ def gf_link(origin: str, dest: str, day: str, adults: int,
 
 # ------------------------------------------------------------------- fetcher
 
-_client: Client | None = None
-
-
 def client() -> Client:
-    global _client
-    if _client is None:
-        _client = Client(
+    """Thread-local primp client (primp isn't thread-safe; one per worker)."""
+    c = getattr(_client_local, "c", None)
+    if c is None:
+        c = Client(
             impersonate="chrome_145",
             impersonate_os="macos",
             referer=True,
             cookie_store=True,
         )
-        _client.set_cookies("https://www.google.com", {"SOCS": SOCS})
-    return _client
+        c.set_cookies("https://www.google.com", {"SOCS": SOCS})
+        _client_local.c = c
+    return c
 
 
-def fetch_ryanair(origin: str, dest: str, day: str, adults: int,
-                  currency: str) -> list[Leg]:
-    """Ryanair's public fare-finder (no key). Returns the cheapest fare per
-    flight; price is per-person so we multiply by party size — treat as an
-    estimate (fare tiers may bump the real total)."""
-    try:
-        r = client().get(
-            "https://services-api.ryanair.com/farfnd/v4/oneWayFares",
-            params={"departureAirportIataCode": origin,
-                    "arrivalAirportIataCode": dest,
-                    "outboundDepartureDateFrom": day,
-                    "outboundDepartureDateTo": day,
-                    "currency": currency})
-        fares = json.loads(r.text).get("fares", []) if r.status_code == 200 else []
-    except Exception:
-        return []
-    legs = []
-    for f in fares:
-        o = f.get("outbound") or {}
-        price = (o.get("price") or {})
-        if price.get("currencyCode") != currency or price.get("value") is None:
-            continue
-        dep, arr = o.get("departureDate", ""), o.get("arrivalDate", "")
-        if not dep.startswith(day):
-            continue
-        legs.append(Leg(
-            origin=o["departureAirport"]["iataCode"],
-            dest=o["arrivalAirport"]["iataCode"],
-            date=day, airline="Ryanair",
-            dep_min=int(dep[11:13]) * 60 + int(dep[14:16]),
-            arr_min=int(arr[11:13]) * 60 + int(arr[14:16]),
-            arr_day_offset=0 if arr.startswith(day) else 1,
-            price=round(price["value"] * adults),
-        ))
-    return legs
+def leg_from_dict(d: dict) -> Leg:
+    return Leg(
+        origin=d["origin"], dest=d["dest"], date=d["date"], airline=d["airline"],
+        dep_min=d["dep_min"], arr_min=d["arr_min"],
+        arr_day_offset=d.get("arr_day_offset", 0), price=d["price"],
+    )
+
+
+def merge_legs(*lists: list[Leg]) -> list[Leg]:
+    """Merge legs from several sources, deduped by (airline, dep, arr) keeping
+    the cheapest price. Google is authoritative for airline naming; the API
+    sources use the same carrier names so the dedupe keys line up."""
+    best: dict[tuple[str, int, int], Leg] = {}
+    for legs in lists:
+        for l in legs:
+            key = (l.airline.lower().replace(" ", ""), l.dep_min, l.arr_min)
+            cur = best.get(key)
+            if cur is None or l.price < cur.price:
+                best[key] = l
+    return sorted(best.values(), key=lambda l: (l.dep_min, l.price))
 
 
 def fetch_legs(
@@ -228,30 +226,87 @@ def fetch_legs(
     ttl_hours: float,
     fresh: bool,
     status=None,
-    sources: tuple = ("google",),
+    sources_list: tuple = ("google",),
 ) -> list[Leg]:
     """All nonstop flights origin→dest on a date, cached. Google Flights is
-    the primary source; 'ryanair' in sources adds the public fare-finder as a
-    fallback when Google returns nothing for the route-date."""
+    the primary source (all carriers); any other names in sources_list —
+    'ryanair', 'easyjet', 'wizz' — are fetched from their public APIs and
+    merged in: they add coverage when Google returns nothing for the
+    route-date, and can surface a cheaper fare tier for the same flight."""
     CACHE_DIR.mkdir(exist_ok=True)
     key = f"{origin}-{dest}-{day}-{adults}pax-{currency}.json"
     cache_file = CACHE_DIR / key
 
     if not fresh and cache_file.exists():
-        blob = json.loads(cache_file.read_text())
-        age_h = (time.time() - blob["fetched_at"]) / 3600
-        # empty results get a short TTL so one consent hiccup doesn't poison
-        # a route-date for the full cache window
-        limit = ttl_hours if blob["legs"] else min(ttl_hours, 0.5)
-        if age_h <= limit:
-            FETCH_STATS["cached"] += 1
-            return [Leg(**l) for l in blob["legs"]]
+        try:
+            blob = json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            blob = None
+        if blob:
+            age_h = (time.time() - blob["fetched_at"]) / 3600
+            # empty results get a short TTL so one consent hiccup doesn't
+            # poison a route-date for the full cache window; also refetch if
+            # the configured sources have grown since this was cached
+            stale_sources = not set(sources_list).issubset(
+                set(blob.get("sources", ["google"])))
+            limit = ttl_hours if blob["legs"] else min(ttl_hours, 0.5)
+            if age_h <= limit and not stale_sources:
+                FETCH_STATS["cached"] += 1
+                return [Leg(**l) for l in blob["legs"]]
 
     if status is not None:
         status.update(f"[dim]fetching[/dim] {origin}→{dest} {day} …")
 
+    # ---- google first (primary: every carrier on the route) ----
+    with SOURCE_SEMS["google"]:
+        g_legs = _fetch_google(origin, dest, day, adults, currency)
+    FETCH_STATS.setdefault("google", {"live": 0, "empty": 0})
+    FETCH_STATS["google"]["live"] += 1
+    if not g_legs:
+        FETCH_STATS["google"]["empty"] += 1
+
+    # ---- extra public-API sources, merged in ----
+    extra: list[list[Leg]] = []
+    for name in sources_list:
+        if name == "google" or name not in sources.SOURCES:
+            continue
+        sem = SOURCE_SEMS.get(name)
+        if sem is not None:
+            with sem:
+                raw = sources.fetch_source(name, client(), origin, dest, day,
+                                           adults, currency)
+        else:
+            raw = sources.fetch_source(name, client(), origin, dest, day,
+                                       adults, currency)
+        time.sleep(sources.delay_for(name))
+        legs_n = [leg_from_dict(d) for d in raw]
+        extra.append(legs_n)
+        FETCH_STATS.setdefault(name, {"live": 0, "empty": 0})
+        FETCH_STATS[name]["live"] += 1
+        if not legs_n:
+            FETCH_STATS[name]["empty"] += 1
+
+    legs = merge_legs(g_legs, *extra)
+
+    # remember the cheapest observation for price history / buy-wait scoring
+    if legs:
+        record_price(key, min(l.price for l in legs))
+
+    blob = {"fetched_at": time.time(), "sources": sorted(sources_list),
+            "legs": [l.__dict__ for l in legs]}
+    tmp = cache_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(blob))
+    tmp.replace(cache_file)  # atomic: readers never see a half-written file
+    return legs
+
+
+def _fetch_google(origin: str, dest: str, day: str, adults: int,
+                  currency: str) -> list[Leg]:
+    """Google Flights via fast-flights. [] if no route that day or consent
+    hiccup (the caller tracks empties for the health warning)."""
     q = create_query(
-        flights=[FlightQuery(date=day, from_airport=origin, to_airport=dest, max_stops=0)],
+        flights=[FlightQuery(date=day, from_airport=origin, to_airport=dest,
+                             max_stops=0)],
         trip="one-way",
         passengers=Passengers(adults=adults),
         currency=currency,
@@ -259,11 +314,10 @@ def fetch_legs(
     res = client().get("https://www.google.com/travel/flights", params=q.params())
     time.sleep(POLITE_DELAY_S)
 
-    legs: list[Leg] = []
     try:
         flights = gf_parse(res.text)
     except Exception:
-        flights = []  # no route that day / consent hiccup — treat as no flights
+        return []
 
     def as_min(t: object) -> int:
         parts = list(t) if isinstance(t, (list, tuple)) else [t]
@@ -272,6 +326,7 @@ def fetch_legs(
         return h * 60 + m
 
     qdate = tuple(int(x) for x in day.split("-"))
+    legs: list[Leg] = []
     for fl in flights:
         if fl.type == "multi" or len(fl.flights) != 1 or not fl.price:
             continue
@@ -292,27 +347,162 @@ def fetch_legs(
                 price=int(fl.price),
             )
         )
-
-    FETCH_STATS["live"] += 1
-    if not legs:
-        FETCH_STATS["live_empty"] += 1
-        if "ryanair" in sources:
-            legs = fetch_ryanair(origin, dest, day, adults, currency)
-
-    cache_file.write_text(
-        json.dumps({"fetched_at": time.time(), "legs": [l.__dict__ for l in legs]})
-    )
     return legs
 
 
+def fetch_many(
+    pairs: list[tuple[str, str, str]],
+    adults: int,
+    currency: str,
+    ttl_hours: float,
+    fresh: bool,
+    status=None,
+    sources_list: tuple = ("google",),
+) -> dict[tuple[str, str, str], list[Leg]]:
+    """Fetch many route-dates (origin, dest, day) in parallel, deduped.
+    Returns {(o, d, day): [Leg]}. A single failing route-date never kills
+    the sweep — it just comes back empty."""
+    todo = list(dict.fromkeys(pairs))
+    out: dict[tuple[str, str, str], list[Leg]] = {}
+    lock = threading.Lock()
+
+    def work(pair: tuple[str, str, str]) -> None:
+        o, d, day = pair
+        try:
+            legs = fetch_legs(o, d, day, adults, currency, ttl_hours, fresh,
+                              None, sources_list)
+        except Exception:
+            legs = []
+        with lock:
+            out[pair] = legs
+
+    futures = [EXECUTOR.submit(work, p) for p in todo]
+    for f in futures:
+        f.result()  # work() swallows exceptions; this just joins
+    return out
+
+
+# ------------------------------------------------------- price history / insight
+
+def price_key(origin: str, dest: str, day: str, adults: int,
+              currency: str) -> str:
+    return f"{origin}-{dest}-{day}-{adults}pax-{currency}"
+
+
+def record_price(key: str, price: int, ts: float | None = None) -> None:
+    """Append one cheapest-price observation for a route-date."""
+    try:
+        with open(HISTORY_FILE, "a") as f:
+            f.write(json.dumps({"key": key, "ts": ts or time.time(),
+                                "min": price}) + "\n")
+    except OSError:
+        pass
+
+
+def _backfill_history_from_cache() -> None:
+    """Seed history from legacy flat cache files so baselines exist on the
+    first run after upgrading."""
+    if not CACHE_DIR.exists():
+        return
+    rows = []
+    for f in CACHE_DIR.glob("*-*-*-*pax-*.json"):
+        try:
+            blob = json.loads(f.read_text())
+            legs = blob.get("legs") or []
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not legs:
+            continue
+        rows.append({"key": f.name[:-5],
+                     "ts": blob.get("fetched_at", time.time()),
+                     "min": min(l["price"] for l in legs)})
+    if not rows:
+        return
+    try:
+        HISTORY_FILE.parent.mkdir(exist_ok=True)
+        with open(HISTORY_FILE, "a") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+    except OSError:
+        pass
+
+
+def load_history() -> dict[str, list[tuple[float, int]]]:
+    """key -> [(ts, min_price), ...] sorted by ts. Backfills from legacy
+    cache files when the history file doesn't exist yet."""
+    if not HISTORY_FILE.exists():
+        _backfill_history_from_cache()
+    hist: dict[str, list[tuple[float, int]]] = {}
+    try:
+        for line in HISTORY_FILE.read_text().splitlines():
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            hist.setdefault(o["key"], []).append((o["ts"], o["min"]))
+    except OSError:
+        pass
+    for v in hist.values():
+        v.sort()
+    return hist
+
+
+def _pct(sorted_prices: list[int], q: float) -> int:
+    if not sorted_prices:
+        return 0
+    return sorted_prices[min(len(sorted_prices) - 1, int(q * len(sorted_prices)))]
+
+
+def price_insight(key: str, price: int, hist: dict | None = None) -> dict | None:
+    """Buy/wait signal for a route-date price vs its own history.
+
+    Returns None until >=3 observations exist for that route-date. Verdicts:
+    good (<= p25), fair (<= p50), typical (<= p75), pricey (> p75), plus a
+    rising/falling/stable trend from the most recent observations.
+    """
+    h = (hist if hist is not None else load_history()).get(key) or []
+    prices = [p for _, p in h]
+    if len(prices) < 3:
+        return None
+    prices.sort()
+    p25, p50, p75 = _pct(prices, .25), _pct(prices, .5), _pct(prices, .75)
+    if price <= p25:
+        verdict, label = "good", "well below typical"
+    elif price <= p50:
+        verdict, label = "fair", "below typical"
+    elif price <= p75:
+        verdict, label = "typical", "around typical"
+    else:
+        verdict, label = "pricey", "above typical"
+    recent = h[-6:]
+    trend = "stable"
+    if len(recent) >= 3:
+        n = len(recent)
+        xs = [i for i in range(n)]
+        ys = [p for _, p in recent]
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / max(
+            sum((x - mx) ** 2 for x in xs), 1e-9)
+        if slope <= -2:
+            trend = "falling"
+        elif slope >= 2:
+            trend = "rising"
+    return {"verdict": verdict, "label": label, "p25": p25, "p50": p50,
+            "p75": p75, "trend": trend, "samples": len(prices)}
+
+
 def warn_if_unhealthy() -> None:
-    live = FETCH_STATS["live"]
-    if live >= 10 and FETCH_STATS["live_empty"] / live > 0.8:
-        console.print(
-            "[bold yellow]⚠ Most live fetches returned no flights — Google may be "
-            "rate-limiting or the parser may have broken. Try again later, or fall "
-            "back to manual Google Flights searches.[/bold yellow]"
-        )
+    for name, st in FETCH_STATS.items():
+        if name == "cached":
+            continue
+        live = st.get("live", 0)
+        if live >= 6 and st.get("empty", 0) / live > 0.85:
+            console.print(
+                f"[bold yellow]⚠ {name}: {st['empty']}/{live} live fetches "
+                f"returned no flights — source may be rate-limiting or its "
+                f"parser/API changed. Other sources are unaffected.[/bold yellow]"
+            )
 
 
 # ------------------------------------------------------------------ composer
@@ -329,7 +519,10 @@ def best_direction(
     arrive_by_min: int | None = None,
     status=None,
 ) -> list[Option]:
-    """Ranked options one direction. reverse=True means dest→origin (the way home)."""
+    """Ranked options one direction. reverse=True means dest→origin (the way home).
+
+    All route-dates needed are fetched in parallel via fetch_many; each source
+    keeps its own concurrency budget so a hub-heavy scan is fast but polite."""
     adults = cfg["adults"]
     currency = cfg.get("currency", "GBP")
     ttl = cfg.get("cache_ttl_hours", 6)
@@ -338,30 +531,41 @@ def best_direction(
 
     froms, tos = (dest_airports, origins) if reverse else (origins, dest_airports)
 
-    options: list[Option] = []
+    # gather every (origin, dest, day) we need, then fetch them all at once
+    pairs: list[tuple[str, str, str]] = []
+    for o in froms:
+        for d in tos:
+            pairs.append((o, d, day))
+    for hub in hubs:
+        for o in froms:
+            pairs.append((o, hub, day))
+        for d in tos:
+            pairs.append((hub, d, day))
+
+    legs_by = fetch_many(pairs, adults, currency, ttl, fresh, status, src_list)
 
     def usable(l: Leg) -> bool:
         return l.arr_day_offset == 0 if require_same_day_arrival else True
 
+    options: list[Option] = []
+
     # direct
     for o in froms:
         for d in tos:
-            for leg in fetch_legs(o, d, day, adults, currency, ttl, fresh, status, src_list):
+            for leg in legs_by.get((o, d, day), []):
                 if usable(leg):
                     options.append(Option([leg], "direct"))
 
     # splits via hubs
     for hub in hubs:
         first_legs = [
-            l
-            for o in froms
-            for l in fetch_legs(o, hub, day, adults, currency, ttl, fresh, status, src_list)
+            l for o in froms
+            for l in legs_by.get((o, hub, day), [])
             if l.arr_day_offset == 0
         ]
         second_legs = [
-            l
-            for d in tos
-            for l in fetch_legs(hub, d, day, adults, currency, ttl, fresh, status, src_list)
+            l for d in tos
+            for l in legs_by.get((hub, d, day), [])
             if usable(l)
         ]
         for a in first_legs:
@@ -391,18 +595,27 @@ def overnight_option(
     adults = cfg["adults"]
     currency = cfg.get("currency", "GBP")
     ttl = cfg.get("cache_ttl_hours", 6)
+    src_list = tuple(cfg.get("flight_sources", ["google"]))
     day_before = (date.fromisoformat(out_day) - timedelta(days=1)).isoformat()
+
+    pairs: list[tuple[str, str, str]] = []
+    for hub in hubs:
+        for o in cfg["origins"]:
+            pairs.append((o, hub, day_before))
+        for d in cfg["destination"]:
+            pairs.append((hub, d, out_day))
+    legs_by = fetch_many(pairs, adults, currency, ttl, fresh, status, src_list)
 
     best: Option | None = None
     for hub in hubs:
         evenings = [
             l for o in cfg["origins"]
-            for l in fetch_legs(o, hub, day_before, adults, currency, ttl, fresh, status)
+            for l in legs_by.get((o, hub, day_before), [])
             if l.dep_min >= 17 * 60 and l.arr_day_offset == 0
         ]
         mornings = [
             l for d in cfg["destination"]
-            for l in fetch_legs(hub, d, out_day, adults, currency, ttl, fresh, status)
+            for l in legs_by.get((hub, d, out_day), [])
             if l.arr_day_offset == 0
             and (arrive_by_min is None or l.arr_min <= arrive_by_min)
         ]
@@ -714,6 +927,7 @@ body.detail-open .top{display:none}
   font-size:1.2rem}
 .row.top .price .p{color:var(--coral)}
 .row .price .delta{display:block;font:500 .68rem var(--mono);color:var(--dim)}
+.row .price .vt{display:block;font:500 .68rem var(--mono);color:var(--amber)}
 .row .bar{grid-area:bar;height:3px;border-radius:2px;background:var(--panel2);
   margin-top:.5rem;position:relative;overflow:hidden}
 .row .bar i{position:absolute;inset:0;right:auto;background:var(--dim);opacity:.55;
@@ -745,6 +959,8 @@ body.detail-open .top{display:none}
   font-size:1.6rem;letter-spacing:.01em;margin:.15rem 0 .1rem}
 .t-route .arr{color:var(--coral);font-weight:600}
 .t-times{font:500 .86rem var(--mono);color:var(--dim)}
+.t-spark{width:100%;height:22px;margin-top:.4rem;color:var(--dim);opacity:.75}
+.t-spark svg{width:100%;height:22px;display:block}
 .t-stub{width:96px;flex:none;border-left:2px dashed var(--line);
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:.3rem;padding:.8rem .5rem;position:relative;background:var(--panel2)}
@@ -824,17 +1040,46 @@ def render_dashboard(
     cfg: dict,
     checked_at: str,
     dead: list[tuple[str, str, dict]] | None = None,
+    hist: dict | None = None,
 ) -> str:
     def esc(s: object) -> str:
         return html_mod.escape(str(s))
 
     adults = cfg["adults"]
+    cur = cfg.get("currency", "GBP")
+    hist = hist or {}
     best = results[0]
     best_price = best["total"]
     max_price = max(r["total"] for r in results)
     n_nights = (date_cls_diff := (datetime.strptime(best["bd"], "%Y-%m-%d")
                 - datetime.strptime(best["od"], "%Y-%m-%d")).days)
     trip_label = "24-hour window" if n_nights == 1 else f"{n_nights}-night window"
+
+    def spark_svg(prices: list[int]) -> str:
+        if len(prices) < 2:
+            return ""
+        lo, hi = min(prices), max(prices)
+        span = (hi - lo) or 1
+        w, h = 96, 22
+        pts = []
+        for i, p in enumerate(prices):
+            x = i / (len(prices) - 1) * (w - 4) + 2
+            y = h - 3 - (p - lo) / span * (h - 6)
+            pts.append(f"{x:.1f},{y:.1f}")
+        return (f'<svg class="spark" viewBox="0 0 {w} {h}" '
+                f'preserveAspectRatio="none"><polyline points="'
+                f'{" ".join(pts)}" fill="none" stroke="currentColor" '
+                f'stroke-width="1.6" stroke-linejoin="round"/></svg>')
+
+    def leg_hist(leg: Leg) -> str:
+        key = price_key(leg.origin, leg.dest, leg.date, adults, cur)
+        prices = [p for _, p in (hist.get(key) or [])]
+        return spark_svg(prices[-24:])  # last 24 observations
+
+    def typical_for(leg: Leg) -> int | None:
+        key = price_key(leg.origin, leg.dest, leg.date, adults, cur)
+        ins = price_insight(key, leg.price, hist)
+        return ins["p50"] if ins else None
 
     def tiered(day: str) -> tuple[list[dict], list[dict], list[dict]]:
         evs = events_by_day.get(day, [])
@@ -849,6 +1094,7 @@ def render_dashboard(
           <div class="t-air">{esc(leg.airline)} · {esc(nice_date(leg.date))}</div>
           <div class="t-route">{esc(leg.origin)} <span class="arr">→</span> {esc(leg.dest)}</div>
           <div class="t-times">{leg.dep_hm} — {leg.arr_hm}</div>
+          {f'<div class="t-spark">{leg_hist(leg)}</div>' if leg_hist(leg) else ''}
         </div>
         <div class="t-stub">
           <div class="t-price">{SYM}{leg.price}</div>
@@ -916,6 +1162,9 @@ def render_dashboard(
         delta = "cheapest" if is_best else f"+{SYM}{t - best_price}"
         badge = '<span class="badge">CHEAPEST</span>' if is_best else ""
         barw = int(t / max_price * 100)
+        to_, tb_ = typical_for(o.legs[0]), typical_for(b.legs[0])
+        vt = (f'<span class="vt">vs typical {SYM}{to_ + tb_}</span>'
+              if to_ is not None and tb_ is not None else "")
 
         rows.append((od, f"""
       <button class="row{top}" onclick="openDay('{did}')">
@@ -924,7 +1173,7 @@ def render_dashboard(
           <span class="lands">· lands {o.legs[-1].arr_hm}</span></span>
         <span class="head">{esc(headliners(od))}</span>
         <span class="price"><span class="p">{SYM}{t}</span>
-          <span class="delta">{esc(delta)}</span></span>
+          <span class="delta">{esc(delta)}</span>{vt}</span>
         <span class="bar"><i style="width:{barw}%"></i></span>
       </button>"""))
 
@@ -1083,6 +1332,168 @@ if(location.hash.startsWith('#day-'))openDay(location.hash.slice(1));
 </body></html>"""
 
 
+# ------------------------------------------------------------------ watch mode
+
+def load_watches() -> list[dict]:
+    if not WATCH_FILE.exists():
+        return []
+    try:
+        data = json.loads(WATCH_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_watches(watches: list[dict]) -> None:
+    WATCH_FILE.write_text(json.dumps(watches, indent=2) + "\n")
+
+
+def _tg_conf(cfg: dict) -> tuple[str | None, str | None]:
+    """(bot token, chat id) from config alerts.telegram + env, tolerantly."""
+    alerts = cfg.get("alerts") or {}
+    tg = alerts.get("telegram") or {}
+    env = tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN")
+    token = os.environ.get(env)
+    if not token and env != "TELEGRAM_BOT_TOKEN":
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    return (token or None), (tg.get("chat_id") or None)
+
+
+def tg_send(cfg: dict, text: str) -> bool:
+    """Send a Telegram message if configured. Returns False when unconfigured
+    or the send fails (watch still prints to stdout either way)."""
+    token, chat = _tg_conf(cfg)
+    if not token or not chat:
+        return False
+    try:
+        r = client().post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text,
+                                "disable_web_page_preview": False})
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _watch_args(w: dict, fresh: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        month=w["month"], nights=w.get("nights", 1), out_dow=w.get("out_dow"),
+        deep=w.get("deep", 4), fresh=fresh, arrive_by=w.get("arrive_by"),
+        home_by=w.get("home_by"), events_filter=w.get("events_filter"),
+    )
+
+
+def cmd_watch_add(args: argparse.Namespace) -> None:
+    cfg = load_config(args)
+    watches = load_watches()
+    wid = secrets.token_hex(4)
+    w = {
+        "id": wid,
+        "name": args.name or f"{args.month} {args.nights}-night",
+        "month": args.month, "nights": args.nights,
+        "out_dow": args.out_dow, "deep": args.deep,
+        "max_total": args.max_total,
+        "arrive_by": args.arrive_by, "home_by": args.home_by,
+        "events_filter": args.events_filter,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "last_alerts": {},  # "od|bd" -> total last alerted at
+    }
+    watches.append(w)
+    save_watches(watches)
+    console.print(f"[green]✓[/green] watch [bold]{wid}[/bold] added — "
+                  f"{w['name']}, alert when a window totals ≤ {SYM}{args.max_total}")
+
+
+def cmd_watch_list(args: argparse.Namespace) -> None:
+    watches = load_watches()
+    if not watches:
+        console.print("[dim]no watches — add one: splitfare watch add "
+                      "--month 2026-09 --nights 1 --max-total 180[/dim]")
+        return
+    t = Table(title="price watches", title_style="bold cyan",
+              title_justify="left", header_style="bold", border_style="dim")
+    t.add_column("id", style="yellow")
+    t.add_column("name")
+    t.add_column("shape")
+    t.add_column("target", justify="right")
+    t.add_column("alerts sent", justify="right")
+    for w in watches:
+        shape = f"{w['month']} · {w['nights']}n"
+        if w.get("out_dow"):
+            shape += f" · out {w['out_dow']}"
+        if w.get("events_filter"):
+            shape += f" · events={w['events_filter']}"
+        t.add_row(w["id"], w.get("name", "?"), shape,
+                  f"{SYM}{w.get('max_total', '?')}", str(len(w.get("last_alerts", {}))))
+    console.print(t)
+
+
+def cmd_watch_remove(args: argparse.Namespace) -> None:
+    watches = load_watches()
+    before = len(watches)
+    watches = [w for w in watches if w["id"] != args.id]
+    save_watches(watches)
+    if len(watches) == before:
+        console.print(f"[yellow]no watch with id {args.id}[/yellow]")
+    else:
+        console.print(f"[green]✓[/green] removed watch {args.id}")
+
+
+def cmd_watch_check(args: argparse.Namespace) -> None:
+    cfg = load_config(args)
+    watches = load_watches()
+    if args.id:
+        watches = [w for w in watches if w["id"] == args.id]
+    if not watches:
+        console.print("[dim]no watches to check — add one: splitfare watch add "
+                      "--month 2026-09 --nights 1 --max-total 180[/dim]")
+        return
+
+    under = 0
+    for w in watches:
+        label = w.get("name", w["id"])
+        with console.status(f"checking {label}…") as status:
+            results, _dead = two_pass_scan(cfg, _watch_args(w, args.fresh),
+                                           cfg["hubs"], status)
+        hits = [r for r in results if r["total"] <= w.get("max_total", 0)]
+        under += len(hits)
+        new_hits = []
+        for r in hits:
+            k = f"{r['od']}|{r['bd']}"
+            prev = w["last_alerts"].get(k)
+            if prev is None or r["total"] < prev * 0.95:  # new, or ≥5% cheaper
+                new_hits.append(r)
+                w["last_alerts"][k] = r["total"]
+        if new_hits:
+            save_watches(watches)  # remember alert state before sending
+            for r in new_hits:
+                o, b = r["outs"][0], r["backs"][0]
+                lines = [
+                    f"🎟️ splitfare · {label}",
+                    f"{nice_date(r['od'])} → {nice_date(r['bd'])} for "
+                    f"{SYM}{r['total']} ({cfg['adults']} adults) — "
+                    f"target ≤ {SYM}{w['max_total']}",
+                    f"OUT  {SYM}{o.price}  {o.describe()}",
+                    f"BACK {SYM}{b.price}  {b.describe()}",
+                ]
+                for l in (o.legs + b.legs):
+                    lines.append(f"🔗 {gf_link(l.origin, l.dest, l.date, cfg['adults'])}")
+                text = "\n".join(lines)
+                sent = tg_send(cfg, text)
+                console.print(
+                    f"🔔 {label}: {nice_date(r['od'])} → {nice_date(r['bd'])} "
+                    f"{SYM}{r['total']}"
+                    + (" · telegram sent" if sent
+                       else " · [dim]telegram not configured "
+                            "(set TELEGRAM_BOT_TOKEN + alerts.telegram.chat_id)[/dim]")
+                )
+        elif hits:
+            console.print(f"[dim]{label}: {len(hits)} under target, already alerted[/dim]")
+        else:
+            console.print(f"[dim]{label}: nothing under {SYM}{w['max_total']}[/dim]")
+    console.print(f"[bold]{under} window(s) under target[/bold] across "
+                  f"{len(watches)} watch(es)")
+
+
 # ---------------------------------------------------------------------- CLI
 
 def load_config(args: argparse.Namespace) -> dict:
@@ -1123,6 +1534,17 @@ def cmd_init(args: argparse.Namespace) -> None:
         "bigger is safer)", default=120)
     ryanair = Confirm.ask(
         "Add Ryanair's public fare API as a fallback source?", default=True)
+    easyjet = Confirm.ask(
+        "Add easyJet's fare API too? (more coverage, no key)", default=True)
+    wizz = Confirm.ask(
+        "Add Wizz Air's API as well? (no key)", default=False)
+    srcs = ["google"]
+    if ryanair:
+        srcs.append("ryanair")
+    if easyjet:
+        srcs.append("easyjet")
+    if wizz:
+        srcs.append("wizz")
     console.print(
         "\n[dim]Events providers: [bold]resident-advisor[/bold] = clubbing, "
         "worldwide · [bold]ticketmaster[/bold]/[bold]skiddle[/bold] = gigs "
@@ -1144,6 +1566,18 @@ def cmd_init(args: argparse.Namespace) -> None:
                       "latitude/longitude/radius_miles to config.json to "
                       "narrow the area[/dim]")
 
+    alerts: dict = {}
+    if Confirm.ask("Set up Telegram alerts for watch mode? (needs a bot "
+                   "token from @BotFather)", default=False):
+        alerts = {
+            "telegram": {
+                "bot_token_env": Prompt.ask(
+                    "Env var holding the bot token", default="TELEGRAM_BOT_TOKEN"),
+                "chat_id": Prompt.ask(
+                    "Telegram chat id (your id: message @userinfobot)"),
+            }
+        }
+
     cfg = {
         "origins": [s.strip().upper() for s in origins.split(",") if s.strip()],
         "destination": [s.strip().upper() for s in dest.split(",") if s.strip()],
@@ -1152,8 +1586,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         "currency": currency.upper(),
         "min_connect_minutes": connect,
         "cache_ttl_hours": 6,
-        "flight_sources": ["google", "ryanair"] if ryanair else ["google"],
+        "flight_sources": srcs,
         "events": events,
+        "alerts": alerts,
     }
     if not cfg["origins"] or not cfg["destination"]:
         console.print("[red]origins and destination are required — run init "
@@ -1198,10 +1633,25 @@ def cmd_window(args: argparse.Namespace) -> None:
 
     if outs and backs:
         o, b = outs[0], backs[0]
+        hist = load_history()
+        cur = cfg.get("currency", "GBP")
+        ins_lines = []
+        for leg in (o.legs[0], b.legs[0]):
+            ins = price_insight(price_key(leg.origin, leg.dest, leg.date,
+                                          cfg["adults"], cur), leg.price, hist)
+            if ins:
+                ins_lines.append(
+                    f"[dim]{leg.origin}→{leg.dest}: {SYM}{leg.price} vs typical "
+                    f"{SYM}{ins['p50']} · {ins['label']} · trend {ins['trend']}[/dim]"
+                )
+        body = (f"[bold green]{SYM}{o.price + b.price} total[/bold green] for "
+                f"{cfg['adults']} adults\n"
+                f"[bold]OUT[/bold]  {SYM}{o.price:<5} {o.describe()}\n"
+                f"[bold]BACK[/bold] {SYM}{b.price:<5} {b.describe()}")
+        if ins_lines:
+            body += "\n\n" + "\n".join(ins_lines)
         console.print(Panel(
-            f"[bold green]{SYM}{o.price + b.price} total[/bold green] for {cfg['adults']} adults\n"
-            f"[bold]OUT[/bold]  {SYM}{o.price:<5} {o.describe()}\n"
-            f"[bold]BACK[/bold] {SYM}{b.price:<5} {b.describe()}",
+            body,
             title="🏆 cheapest combination", title_align="left", border_style="green",
         ))
         print_booking_links(outs, cfg["adults"], "outbound")
@@ -1314,6 +1764,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
         return
 
     console.print()
+    hist = load_history()
+    cur = cfg.get("currency", "GBP")
     parts = []
     for i, (total, out_day, back_day, o, b) in enumerate(results):
         marker = "🏆 " if i == 0 else f"{i + 1}. "
@@ -1325,6 +1777,16 @@ def cmd_scan(args: argparse.Namespace) -> None:
             f"   OUT  {SYM}{o.price:<5} {o.describe()}{conn_o}\n"
             f"   BACK {SYM}{b.price:<5} {b.describe()}{conn_b}"
         )
+        # buy/wait insight: cheapest legs vs their own route-date history
+        for leg in (o.legs[0], b.legs[0]):
+            ins = price_insight(price_key(leg.origin, leg.dest, leg.date,
+                                          cfg["adults"], cur), leg.price, hist)
+            if ins:
+                parts.append(
+                    f"   [dim]{leg.origin}→{leg.dest}: {SYM}{leg.price} vs "
+                    f"typical {SYM}{ins['p50']} · {ins['label']} · "
+                    f"trend {ins['trend']}[/dim]"
+                )
     console.print(Panel("\n\n".join(parts), title="Final ranking (cheapest first)",
                         title_align="left", border_style="green"))
 
@@ -1388,9 +1850,17 @@ def two_pass_scan(cfg: dict, args: argparse.Namespace, hubs: list[str],
     ranked.sort(key=lambda r: r[0])
     deep = ranked if args.deep == 0 else ranked[: args.deep]
     results, dead = [], []
+    ev_filter = getattr(args, "events_filter", None)  # None | "any" | "big"
     for i, (_, out_day, back_day) in enumerate(deep, 1):
         status.update(f"[dim]deep-scanning[/dim] {out_day} → {back_day} "
                       f"[dim]({i}/{len(deep)})[/dim]")
+        if ev_filter:
+            evs = fetch_events(out_day)
+            if ev_filter == "any" and not evs:
+                continue
+            if ev_filter == "big" and not any(
+                    venue_tier(e["venue"]) == 1 for e in evs):
+                continue
         outs = best_direction(cfg["origins"], cfg["destination"], out_day, hubs, cfg,
                               args.fresh, arrive_by_min=arrive_by, status=status)
         backs = best_direction(cfg["origins"], cfg["destination"], back_day, hubs, cfg,
@@ -1445,7 +1915,8 @@ def cmd_publish(args: argparse.Namespace) -> None:
         events_by_day = {d: fetch_events(d) for d in days_needed}
 
     checked_at = datetime.now().strftime("%a %-d %b, %H:%M")
-    page = render_dashboard(results, events_by_day, cfg, checked_at, dead)
+    page = render_dashboard(results, events_by_day, cfg, checked_at, dead,
+                            hist=load_history())
     site = HOME_DIR / "site"
     site.mkdir(exist_ok=True)
     (site / "index.html").write_text(page)
@@ -1577,6 +2048,8 @@ def main() -> None:
     s.add_argument("--home-by", metavar="HH:MM", help="return must land by this time")
     s.add_argument("--fresh", action="store_true")
     s.add_argument("--events", action="store_true", help="show events for the winning window")
+    s.add_argument("--events-filter", choices=["any", "big"],
+                   help="only keep windows where something's on: any event, or a tier-1 venue")
     s.add_argument("--html", metavar="FILE", help="write a shareable HTML report")
     s.set_defaults(func=cmd_scan)
 
@@ -1595,8 +2068,34 @@ def main() -> None:
     p.add_argument("--arrive-by", metavar="HH:MM")
     p.add_argument("--home-by", metavar="HH:MM")
     p.add_argument("--fresh", action="store_true")
+    p.add_argument("--events-filter", choices=["any", "big"],
+                   help="only keep windows where something's on: any event, or a tier-1 venue")
     p.add_argument("--deploy", action="store_true", help="deploy site/ to Vercel")
     p.set_defaults(func=cmd_publish)
+
+    watch = sub.add_parser("watch", help="trip-shape price watches with alerts")
+    wsub = watch.add_subparsers(dest="watch_cmd", required=True)
+    wa = wsub.add_parser("add", help="add a watch (alerts when a window hits your target)")
+    wa.add_argument("--month", required=True, help="YYYY-MM")
+    wa.add_argument("--nights", type=int, default=1)
+    wa.add_argument("--out-dow", help="limit outbound days, e.g. thu,fri,sat,sun")
+    wa.add_argument("--deep", type=int, default=4)
+    wa.add_argument("--max-total", type=int, required=True,
+                    help="alert when a window totals at or below this (whole party)")
+    wa.add_argument("--arrive-by", metavar="HH:MM")
+    wa.add_argument("--home-by", metavar="HH:MM")
+    wa.add_argument("--events-filter", choices=["any", "big"])
+    wa.add_argument("--name", help="label for the watch")
+    wa.set_defaults(func=cmd_watch_add)
+    wl = wsub.add_parser("list", help="list watches")
+    wl.set_defaults(func=cmd_watch_list)
+    wr = wsub.add_parser("remove", help="remove a watch")
+    wr.add_argument("id")
+    wr.set_defaults(func=cmd_watch_remove)
+    wc = wsub.add_parser("check", help="run all watches once (cron-friendly)")
+    wc.add_argument("--id", help="only check this watch id")
+    wc.add_argument("--fresh", action="store_true")
+    wc.set_defaults(func=cmd_watch_check)
 
     a = sub.add_parser("ask", help="ask in plain English (uses the claude CLI)")
     a.add_argument("question", nargs="+", help="e.g. cheapest weekend in august landing before 2pm")

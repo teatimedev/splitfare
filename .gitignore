@@ -1,5 +1,6 @@
 # personal config & generated output
 config.json
+watches.json
 site/
 .cache/
 *.html

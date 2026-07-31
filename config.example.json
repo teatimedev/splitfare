@@ -6,7 +6,14 @@
   "currency": "GBP",
   "min_connect_minutes": 120,
   "cache_ttl_hours": 6,
+  "flight_sources": ["google", "ryanair"],
   "events": {
     "provider": "ibiza-spotlight"
+  },
+  "alerts": {
+    "telegram": {
+      "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "chat_id": "123456789"
+    }
   }
 }

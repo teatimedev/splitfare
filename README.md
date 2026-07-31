@@ -34,9 +34,19 @@ night.*
   time*.
 - **Overnight positioning** — when landing early is impossible same-day, it
   prices flying to the hub the evening before and catching the morning flight.
+- **Multi-source fares** — Google Flights plus the airlines' own public fare
+  APIs (Ryanair, easyJet, Wizz), fetched in parallel and merged, deduped by
+  flight, cheapest fare wins. Each source has its own health check.
+- **Price intelligence** — every route-date keeps a price history; results
+  show a buy/wait verdict vs its own typical range (good/fair/typical/pricey)
+  and a rising/falling/stable trend.
+- **Watch mode** — set a trip shape + target price ("any 24hr window in
+  September under £180 for 2") and get a Telegram ping the moment one
+  appears. Cron-friendly.
 - **Events fusion** — every candidate night shows who's playing, via pluggable
   providers (Resident Advisor worldwide, Ticketmaster, Skiddle, Ibiza
-  Spotlight — or write your own in ~30 lines).
+  Spotlight — or write your own in ~30 lines). `--events-filter big` turns
+  the calendar into a search constraint: only windows with a tier-1 night.
 - **A phone dashboard** — `publish` renders a static site: browse every
   window by day, tap into flights, alternatives and lineups. Host it anywhere.
 - **AI-agent native** — an MCP server exposes the whole thing to any
@@ -134,22 +144,85 @@ Adding one is a single function in [providers.py](providers.py).
 
 Primary data comes from **Google Flights** via
 [fast-flights](https://github.com/AWeirdDev/flights) — the only free source
-that aggregates all the budget carriers. **Ryanair's public fare-finder API**
-(no key) is available as an automatic fallback. For the curious: Amadeus
-retired its self-service API in 2026, Kiwi's Tequila closed to new signups,
-and Duffel doesn't carry Ryanair/Wizz — scraping the aggregator remains the
-pragmatic play, which is also why this is a *run-it-yourself* tool and not a
-website.
+that aggregates all the budget carriers. On top of that, splitfare merges in
+the airlines' own public (no-key) fare APIs, configured in
+`"flight_sources"`:
+
+| source | what it adds |
+|---|---|
+| `google` | every carrier on the route (always primary) |
+| `ryanair` | Ryanair's public fare-finder; fills gaps + cheaper fare tiers |
+| `easyjet` | easyJet's flightShopping endpoint |
+| `wizz` | Wizz Air's search API |
+
+All enabled sources are fetched in **parallel** (per-source concurrency
+budget — polite but ~4-5x faster than the old sequential sweep) and merged,
+deduped by flight, keeping the cheapest fare. Fetches are cached; the cache
+refetches automatically when you add a source that wasn't there before.
+
+> **IP-dependent sources:** Ryanair works from anywhere, but easyJet/Wizz
+> sometimes block datacenter IPs (VPSes). If a source shows as empty in the
+> per-source health warning, run from a residential IP or drop it from
+> `flight_sources` — google alone still covers those carriers via the
+> aggregator.
+
+For the curious: Amadeus retired its self-service API in 2026, Kiwi's Tequila
+closed to new signups, and Duffel doesn't carry Ryanair/Wizz — scraping the
+aggregator remains the pragmatic play, which is also why this is a
+*run-it-yourself* tool and not a website.
+
+### Price history, buy/wait scoring, and watches
+
+Every fetch appends the cheapest price to `.cache/price_history.jsonl`
+(backfilled from older caches on first run). With ≥3 observations for a
+route-date you get a **buy/wait signal** on every result:
+
+- verdict vs the route-date's own history: `good` (≤ p25) / `fair` (≤ p50) /
+  `typical` / `pricey` (> p75)
+- a rising/falling/stable **trend** from recent observations
+
+The dashboard shows "vs typical" badges and a **sparkline of the last 24
+price observations** on each flight ticket.
+
+**Watch mode** turns "run a scan" into "ping me when it happens":
+
+```bash
+splitfare watch add --month 2026-09 --nights 1 --max-total 180 --name "Sep 24hr"
+splitfare watch list
+splitfare watch check          # cron-friendly; alerts on new/cheaper hits only
+splitfare watch remove ID
+```
+
+`watch check` scans each watch's trip shape and alerts when a window totals
+at or below the target — only on first appearance or a ≥5% price drop, so
+cron doesn't spam you. Alerts go to **Telegram** when configured:
+
+```json
+"alerts": { "telegram": { "bot_token_env": "TELEGRAM_BOT_TOKEN",
+                           "chat_id": "123456789" } }
+```
+
+(create a bot with @BotFather; your chat id comes from @userinfobot). Without
+a token, `watch check` prints to stdout and exits 0 — safe for cron either
+way. Example cron: `0 8 * * * cd ~/projects/splitfare && .venv/bin/splitfare watch check`.
+
+### Events as a constraint
+
+`scan`/`publish`/`watch` take `--events-filter any|big`: only keep windows
+whose night has any event, or at least one tier-1 venue (Ushuaïa, Hï, Pacha,
+Amnesia, DC10, Eden…). "Cheapest 24hrs in Ibiza with a big night on" is one
+command now.
 
 ## How it works, honestly
 
-- **The Google source can break whenever Google changes things.** Treat prices
-  as estimates and book each leg directly with the airline — every result
-  links to a matching search.
+- **Any source can break.** Treat prices as estimates and book each leg
+  directly with the airline — every result links to a matching search. The
+  tool tracks per-source health (live vs empty fetches) and warns you per
+  source instead of silently showing "no flights".
 - **Split tickets carry real risk.** Separate bookings mean no
   missed-connection protection. The tool enforces a minimum gap and shows the
   gap on every result, but the risk is yours. Prefer long gaps.
-- Be polite: requests are rate-limited and cached. Don't hammer it.
+- Be polite: requests are rate-limited (per source) and cached. Don't hammer it.
 
 ## Development
 
