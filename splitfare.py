@@ -1440,9 +1440,9 @@ def cmd_watch_remove(args: argparse.Namespace) -> None:
 
 def cmd_watch_check(args: argparse.Namespace) -> None:
     cfg = load_config(args)
-    watches = load_watches()
-    if args.id:
-        watches = [w for w in watches if w["id"] == args.id]
+    all_watches = load_watches()
+    watches = ([w for w in all_watches if w["id"] == args.id] if args.id
+               else all_watches)
     if not watches:
         console.print("[dim]no watches to check — add one: splitfare watch add "
                       "--month 2026-09 --nights 1 --max-total 180[/dim]")
@@ -1464,7 +1464,7 @@ def cmd_watch_check(args: argparse.Namespace) -> None:
                 new_hits.append(r)
                 w["last_alerts"][k] = r["total"]
         if new_hits:
-            save_watches(watches)  # remember alert state before sending
+            save_watches(all_watches)  # full list — --id must not drop others
             for r in new_hits:
                 o, b = r["outs"][0], r["backs"][0]
                 lines = [

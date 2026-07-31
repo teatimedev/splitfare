@@ -109,6 +109,40 @@ def test_watch_roundtrip(tmp_path, monkeypatch):
     assert load_watches()[0]["id"] == "abc123"
 
 
+def test_watch_check_by_id_keeps_sibling_watches(tmp_path, monkeypatch):
+    """Regression: `watch check --id X` used to save the FILTERED list back to
+    disk, silently deleting every other watch when X fired a hit."""
+    import argparse
+    import splitfare as sf
+    monkeypatch.setattr(sf, "WATCH_FILE", tmp_path / "watches.json")
+    save_watches([
+        {"id": "aaa", "name": "sep", "month": "2026-09", "nights": 1,
+         "max_total": 180, "last_alerts": {}},
+        {"id": "bbb", "name": "aug", "month": "2026-08", "nights": 1,
+         "max_total": 200, "last_alerts": {}},
+    ])
+
+    o = leg(date="2026-09-02", dep=400, arr=650, price=60)
+    b = leg(o="IBZ", d="BFS", date="2026-09-03", dep=800, arr=1000, price=82)
+    hit = {"total": 142, "od": "2026-09-02", "bd": "2026-09-03",
+           "outs": [__import__("splitfare").Option([o], "direct")],
+           "backs": [__import__("splitfare").Option([b], "direct")]}
+
+    def fake_scan(cfg, args, hubs, status):
+        return [hit], []
+
+    monkeypatch.setattr(sf, "two_pass_scan", fake_scan)
+    monkeypatch.setattr(sf, "tg_send", lambda cfg, text: False)
+    monkeypatch.setattr(sf, "console", type("Q", (), {
+        "print": lambda *a, **k: None, "status": lambda *a, **k: type(
+            "S", (), {"__enter__": lambda s: s, "__exit__": lambda *x: None})()})())
+
+    sf.cmd_watch_check(argparse.Namespace(id="aaa", fresh=False))
+    ids = {w["id"] for w in load_watches()}
+    assert ids == {"aaa", "bbb"}, f"sibling watch was dropped: {ids}"
+    assert load_watches()[0]["last_alerts"]["2026-09-02|2026-09-03"] == 142
+
+
 # ---------------------------------------------------------------- dashboard
 
 def _min_results():
