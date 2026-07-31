@@ -135,4 +135,44 @@ from the JS bundles, 2026-07-31):
 - No embedded AWS credentials in the bundles (no AKIA keys); the secrets
   are fetched per-session.
 
+## Getting past the IP gate (egress options, ranked)
+
+The automation is solved; the residual gate is that easyJet's booking app
+denies this VPS's datacenter IP (verified: identical user-level flow, fresh
+browser session, still Access Denied / challenge loop). Same class of block
+as Wizz Air's 429 on this IP and xAI's EU geo-restriction. Options, in
+order of cost/effort:
+
+1. **Tailscale exit node via the home Mac (free, ~2 min — recommended).**
+   The VPS already runs Tailscale (`tailscaled.service` active), and
+   `jordans-macbook-air` is already in the tailnet (online). Have the Mac
+   advertise as an exit node (Tailscale app: Preferences → "Run exit node",
+   or `sudo tailscale up --advertise-exit-node`), then run:
+   `/home/hermes/.hermes/scripts/tailscale-enable-exit.sh`
+   (refuses until the Mac advertises; prints the new egress IP).
+   A watchdog (`tailscale-exit-watchdog.timer`, every 2 min) clears the
+   exit node automatically if the Mac goes offline, so the VPS never
+   blackholes. Revert: `sudo tailscale set --exit-node=`.
+   Bonus: this same egress fixes Wizz's 429 and xAI's Grok geo-block
+   (both need UK/residential egress).
+
+2. **Residential proxy service (from ~$3/mo, 10 min wiring).** The camofox
+   bridge has built-in proxy support via env vars (see
+   `~/camofox-browser/lib/config.js`): `PROXY_STRATEGY` (e.g.
+   `residential`), `PROXY_HOST`, `PROXY_PORT`, `PROXY_USERNAME`,
+   `PROXY_PASSWORD`, `PROXY_COUNTRY=GB`, and a provider integration
+   (`PROXY_PROVIDER`, default `decodo`). Set them in the
+   `camofox-browser.service` systemd unit, restart, and the browser source
+   egresses through the proxy. The API sources can do the same via
+   primp's `proxy=` parameter (`fetch_easyjet`/`fetch_wizz`).
+
+3. **Run the scan from home directly.** `splitfare` + camofox on the Mac:
+   the source needs no VPS. Zero infra, manual.
+
+4. **Mobile hotspot for one-off scans.** Tethered laptop = mobile IP,
+   accepted by airline anti-fraud.
+
+Free anonymous proxy lists do NOT work here (all dead/failing on this
+target — tested 2026-07-31).
+
 Last verified: 2026-07-31.
