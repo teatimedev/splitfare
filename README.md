@@ -152,7 +152,8 @@ the airlines' own public (no-key) fare APIs, configured in
 |---|---|
 | `google` | every carrier on the route (always primary) |
 | `ryanair` | Ryanair's public fare-finder; fills gaps + cheaper fare tiers |
-| `easyjet` | easyJet's flightShopping endpoint |
+| `easyjet` | easyJet's homepage fare-calendar endpoint (Akamai-gated; needs `EASYJET_COOKIES` from a real browser) |
+| `easyjet-browser` | drives a real browser (camofox bridge) through easyJet's booking flow and scrapes results — works from residential IPs |
 | `wizz` | Wizz Air's search API |
 
 All enabled sources are fetched in **parallel** (per-source concurrency

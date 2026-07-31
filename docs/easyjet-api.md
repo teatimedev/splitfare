@@ -88,20 +88,42 @@ Bot Manager's "Continue" flow, not a simple referer/UA gate.
    from a residential IP. Fragile — tokens rotate and are IP/UA-bound, but
    worth trying. `fetch_easyjet` in `sources.py` reads a cookies file when
    `EASYJET_COOKIES` points at one.
-3. **Browser-driven adapter (robust):** drive a headless/stealth browser
-   (e.g. the local camofox browser server on :9377) to load the deeplink,
-   let it solve Akamai, and read fares from the page. This is the only
-   method that works from a datacenter IP. splitfare doesn't ship this yet —
-   the `sources` module interface (`(http, origin, dest, day, adults,
-   currency) -> list[dict]`) is where it would plug in.
+3. **Browser-driven adapter (built, in `sources.py` as `easyjet-browser`):**
+   drives a real browser through easyJet's own search flow and reads the
+   results page. The browser solves Akamai the way a user does (it IS a
+   user), so this is the method that works where everything else is blocked.
+   It uses the camofox bridge REST API (`EASYJET_BROWSER_URL`, default
+   `http://localhost:9377`):
+   - `POST /tabs/open {userId, url: <deeplink>}` — starts the booking search
+   - poll `GET /tabs/{tabId}/snapshot` until fares or Access Denied appear
+   - `POST /tabs/{tabId}/evaluate` → grab `document.documentElement.outerHTML`
+   - `DELETE /tabs/{tabId}` — always clean up
+   The deeplink format (produced by the live search pod):
+   `https://www.easyjet.com/deeplink?dep=<origin>&dest=<dest>&dd=<date>&isOneWay=on&apax=<adults>&cpax=0&ipax=0&fare=Y&lang=en`
+   with `*`-market codes for grouped origins (`*BE` = Belfast).
+   Fares are extracted by `ej_extract_flights()` — known selectors first,
+   decoded-text pattern scan as fallback (unit-tested against canned HTML).
+   **IP caveat:** the booking app denies datacenter IPs (verified: the
+   deeplink returns Access Denied from a VPS even in a real browser). From a
+   residential IP the adapter returns fares; from a datacenter IP it returns
+   `[]` and the per-source health stats flag it. Add `"easyjet-browser"` to
+   `flight_sources` (e.g. on your home machine) alongside `google`/`ryanair`.
 
-## Status in splitfare
+## What the booking app's fare API looks like (for future reference)
 
-`sources.py` `fetch_easyjet` targets the homepage availability endpoint
-(endpoint 1 above) with a market-group map for Belfast (`*BE`) and IATA
-fallback, plus optional `EASYJET_COOKIES` injection. From a datacenter IP it
-will return empty (Akamai) — the per-source health stats will show it, and
-the source is expected to light up from a residential IP or via the
-browser-driven adapter.
+The booking app's real fare search (behind the same wall, but documented
+from the JS bundles, 2026-07-31):
+
+- Host comes from `FpsHostV2` in a secret called
+  `Stream_<B2B_STREAM>_<B2B_CREDENTIALS_VERSION>` fetched from AWS Secrets
+  Manager (the app bundles the AWS SDK and calls GetSecretValue at runtime).
+- `POST https://<FpsHostV2>/comm/v2/flight-fare/fare-search/get`
+  and `.../comm/v2/flight-fare/flight-availability/search`
+- Headers: `Authorization: Bearer <OAuth token>` (client_credentials against
+  the secret's `tokenURL` with embedded `ClientID`/`ClientSecret`/`scope`),
+  `X-Client-Id: "easyjet Web"`, `X-POS-ID: "DigitalWeb"`,
+  `X-Client-Transaction-Id: <uuid>`.
+- No embedded AWS credentials in the bundles (no AKIA keys); the secrets
+  are fetched per-session.
 
 Last verified: 2026-07-31.

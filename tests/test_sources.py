@@ -99,6 +99,56 @@ def test_pct_bounds():
 
 # ------------------------------------------------------------- watch storage
 
+def test_easyjet_deeplink_and_codes():
+    import sources
+    assert sources.ej_origin_code("BFS") == "*BE"
+    assert sources.ej_origin_code("LTN") == "LTN"
+    url = sources.ej_deeplink("BFS", "LTN", "2026-09-02", 2)
+    assert "dep=*BE" in url and "dest=LTN" in url
+    assert "dd=2026-09-02" in url and "apax=2" in url
+
+
+CANNED_EJ_HTML = """
+<html><body>
+<div data-testid="flight-card">
+  <span class="time">06:40</span><span class="time">07:55</span>
+  <span class="price">£32.49</span>
+</div>
+<div data-testid="flight-card">
+  <span class="time">12:15</span><span class="time">13:30</span>
+  <span class="price">£41.00</span>
+</div>
+</body></html>
+"""
+
+
+def test_easyjet_extract_cards():
+    import sources
+    legs = sources.ej_extract_flights(CANNED_EJ_HTML, "BFS", "LTN",
+                                      "2026-09-02", 2)
+    assert len(legs) == 2
+    assert legs[0]["dep_min"] == 6 * 60 + 40
+    assert legs[0]["arr_min"] == 7 * 60 + 55
+    assert legs[0]["price"] == round(32.49 * 2)  # totals for the party
+
+
+def test_easyjet_extract_fallback_scan():
+    import sources
+    html = ("<html><body><h1>Choose your flight</h1>"
+            "06:40 - 07:55 London Luton &pound;32.49 per person "
+            "12:15 - 13:30 London Luton &pound;41.00"
+            "</body></html>")
+    legs = sources.ej_extract_flights(html, "BFS", "LTN", "2026-09-02", 2)
+    assert len(legs) >= 1
+    assert legs[0]["airline"] == "easyJet"
+
+
+def test_easyjet_extract_empty_on_garbage():
+    import sources
+    assert sources.ej_extract_flights("<html>Access Denied</html>",
+                                      "BFS", "LTN", "2026-09-02", 2) == []
+
+
 def test_watch_roundtrip(tmp_path, monkeypatch):
     import splitfare as sf
     monkeypatch.setattr(sf, "WATCH_FILE", tmp_path / "watches.json")

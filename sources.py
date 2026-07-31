@@ -20,6 +20,7 @@ Config: "flight_sources": ["google", "ryanair", "easyjet", "wizz"]
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,6 +29,7 @@ SOURCE_LIMITS: dict[str, tuple[int, float]] = {
     "google": (3, 1.0),
     "ryanair": (4, 0.4),
     "easyjet": (4, 0.4),
+    "easyjet-browser": (1, 0.5),  # one browser tab at a time
     "wizz": (4, 0.4),
 }
 
@@ -113,6 +115,34 @@ def fetch_ryanair(http, origin: str, dest: str, day: str, adults: int,
 # (observed: *BE = Belfast). Plain IATA codes work for the destination and
 # for most origins; keep this map for the groups we've confirmed.
 EASYJET_MARKET_GROUPS = {"BFS": "*BE", "BHD": "*BE"}
+
+
+def ej_origin_code(origin: str) -> str:
+    return EASYJET_MARKET_GROUPS.get(origin.upper(), origin.upper())
+
+
+def ej_deeplink(origin: str, dest: str, day: str, adults: int) -> str:
+    """Booking-app entry URL the homepage search pod produces. Loading this
+    in a real browser starts the flight search for the route/date."""
+    return ("https://www.easyjet.com/deeplink?dep={dep}&dest={dest}"
+            "&dd={day}&isOneWay=on&apax={adults}&cpax=0&ipax=0&fare=Y&lang=en"
+            .format(dep=ej_origin_code(origin), dest=dest.upper(), day=day,
+                    adults=adults))
+
+
+# Selectors for the booking results page, in order of preference. easyJet's
+# app uses data-testid attributes heavily; the exact flight-card testid is
+# not confirmable from a datacenter IP (the booking app denies those) — the
+# extractor falls back to scanning for time/price patterns.
+EJ_FLIGHT_CARD_SELECTORS = (
+    '[data-testid="flight-card"]',
+    '[data-testid*="flightCard"]',
+    '[data-testid*="flight-card"]',
+    '[data-testid*="fare-card"]',
+    '[data-testid*="flightRow"]',
+    '[class*="flightCard"]',
+    '[class*="flight-card"]',
+)
 
 
 def _ej_cookies() -> str | None:
@@ -280,6 +310,140 @@ def fetch_wizz(http, origin: str, dest: str, day: str, adults: int,
             "price": round(float(amount) * adults),
         })
     return legs
+
+
+def ej_extract_flights(html_text: str, origin: str, dest: str, day: str,
+                       adults: int) -> list[dict]:
+    """Parse easyJet booking results HTML into normalized legs.
+
+    Best-effort: tries the known selectors first, then falls back to a
+    text-pattern scan over the decoded body text (times like 06:40 and
+    prices like £32.49 near each other). Returns [] when the page shape is
+    unrecognized (e.g. Access Denied or a layout change) — callers treat
+    that as 'no data'."""
+    from selectolax.lexbor import LexborHTMLParser
+    try:
+        parser = LexborHTMLParser(html_text)
+    except Exception:
+        return []
+    legs: list[dict] = []
+    seen: set[tuple] = set()
+
+    def push(dep_min: int | None, arr_min: int | None, price: float | None,
+             airline: str) -> None:
+        if dep_min is None or arr_min is None or price is None:
+            return
+        sig = (dep_min, arr_min, round(price * adults))
+        if sig in seen:
+            return
+        seen.add(sig)
+        legs.append({
+            "origin": origin.upper(), "dest": dest.upper(), "date": day,
+            "airline": airline or "easyJet",
+            "dep_min": dep_min, "arr_min": arr_min, "arr_day_offset": 0,
+            "price": round(price * adults),
+        })
+
+    TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+    PRICE_RE = re.compile(r"£\s?([0-9]+(?:\.[0-9]{2})?)")
+
+    cards = []
+    for sel in EJ_FLIGHT_CARD_SELECTORS:
+        cards = parser.css(sel)
+        if cards:
+            break
+
+    if cards:
+        for card in cards:
+            text = card.text(separator=" ", strip=True)
+            time_matches = TIME_RE.findall(text)
+            price_m = PRICE_RE.search(text)
+            if len(time_matches) < 2 or not price_m:
+                continue
+            dep_min = int(time_matches[0][0]) * 60 + int(time_matches[0][1])
+            arr_min = int(time_matches[1][0]) * 60 + int(time_matches[1][1])
+            push(dep_min, arr_min, float(price_m.group(1)), "easyJet")
+        if legs:
+            return legs
+
+    # fallback: scan decoded body text (entities resolved, whitespace kept)
+    body = parser.body
+    if body is None:
+        return []
+    body_text = body.text(separator=" ", strip=True)
+    for m in TIME_RE.finditer(body_text):
+        dep_min = int(m.group(1)) * 60 + int(m.group(2))
+        tail = body_text[m.end():m.end() + 400]
+        pm = PRICE_RE.search(tail)
+        if not pm:
+            continue
+        am = TIME_RE.search(tail[:pm.start()])
+        arr_min = (int(am.group(1)) * 60 + int(am.group(2))) if am \
+            else dep_min + 150
+        push(dep_min, arr_min, float(pm.group(1)), "easyJet")
+        if len(legs) >= 30:
+            break
+    return legs
+
+
+@source("easyjet-browser")
+def fetch_easyjet_browser(http, origin: str, dest: str, day: str, adults: int,
+                          currency: str) -> list[dict]:
+    """Drive a real browser (camofox bridge) through easyJet's booking flow
+    and scrape the results. This is the method that works where the API is
+    Akamai-gated: the browser IS the user, so easyJet lets it through.
+
+    Requires the camofox bridge (EASYJET_BROWSER_URL, default
+    http://localhost:9377) and a network easyJet accepts (residential IP —
+    datacenter IPs are denied on the booking app). Returns [] on any failure;
+    per-source health stats will show it."""
+    import os
+    import time as _time
+    import urllib.request
+
+    base = os.environ.get("EASYJET_BROWSER_URL", "http://localhost:9377")
+    user = os.environ.get("EASYJET_BROWSER_USER", "splitfare")
+    url = ej_deeplink(origin, dest, day, adults)
+
+    def bridge(method: str, path: str, payload: dict | None = None) -> dict:
+        req = urllib.request.Request(base + path, method=method,
+                                     headers={"content-type": "application/json"})
+        data = json.dumps(payload).encode() if payload is not None else None
+        with urllib.request.urlopen(req, data=data, timeout=30) as r:
+            return json.loads(r.read().decode())
+
+    try:
+        tab = bridge("POST", "/tabs/open", {"userId": user, "url": url})
+        tab_id = tab.get("tabId") or tab.get("id")
+        if not tab_id:
+            return []
+        try:
+            # poll until results render or a clear dead-end (Access Denied)
+            for _ in range(30):
+                _time.sleep(2)
+                snap = bridge("GET", f"/tabs/{tab_id}/snapshot",
+                              {"userId": user})
+                text = (snap.get("text") or snap.get("content")
+                        or json.dumps(snap))
+                if "Access Denied" in text or "denied" in text.lower()[:200]:
+                    return []
+                if re.search(r"£\s?[0-9]", text) or re.search(
+                        r"\b[0-2]\d:[0-5]\d\b", text):
+                    break
+            eval_res = bridge("POST", f"/tabs/{tab_id}/evaluate", {
+                "userId": user,
+                "expression": "document.documentElement.outerHTML",
+            })
+            html_text = (eval_res.get("result") or eval_res.get("value")
+                         or json.dumps(eval_res))
+            return ej_extract_flights(html_text, origin, dest, day, adults)
+        finally:
+            try:
+                bridge("DELETE", f"/tabs/{tab_id}", {"userId": user})
+            except Exception:
+                pass
+    except Exception:
+        return []
 
 
 def fetch_source(name: str, http, origin: str, dest: str, day: str,
